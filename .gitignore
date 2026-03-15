@@ -1,0 +1,5 @@
+# Ignore all log files
+*.log
+
+# Ignore specific sensitive credential file
+info_and_keys.json

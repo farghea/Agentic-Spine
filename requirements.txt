@@ -1,0 +1,8 @@
+langgraph
+langchain
+langchain-google-genai
+langchain-experimental
+google-generativeai
+pandas
+numpy
+matplotlib
