@@ -30,6 +30,5 @@ conda env create -f environment_agent.yml
 ```bash
 conda create -n agent python=3.12.12 -y
 conda activate agent
-pip install -r requirements.txt
-# (or pip install -r requirements_agent.txt)
+pip install -r requirements_agent.txt
 ```
