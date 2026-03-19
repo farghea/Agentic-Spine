@@ -141,7 +141,7 @@ import io
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import google.generativeai as genai
+from google import genai
 from openai import OpenAI
 
 # --- MISSING IMPORTS CAUSING YOUR ERROR ---
@@ -149,15 +149,57 @@ from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_experimental.agents import create_pandas_dataframe_agent
 
-# MODEL = 'gemini'
-# MODEL_TYPE = 'gemini-2.5-flash-lite'
-# MODEL_TYPE = 'gemini-2.5-flash'
+
+def _gemini_generate_text(api_key, model_name, prompt):
+    """Generate plain text from Gemini using the google.genai SDK."""
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(model=model_name, contents=prompt)
+    text = getattr(response, "text", None)
+    if text:
+        return text
+
+    # Fallback for responses where text is segmented into parts.
+    parts = []
+    for candidate in getattr(response, "candidates", []) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", []) or []:
+            part_text = getattr(part, "text", None)
+            if part_text:
+                parts.append(part_text)
+    return "\n".join(parts)
+
+MODEL = 'gemini'
+MODEL_TYPE = 'gemini-2.5-flash'
+#MODEL_TYPE = 'gemini-2.5-flash'
 
 
-MODEL = 'openai'
-# MODEL_TYPE = 'gpt-4o-mini'
-MODEL_TYPE = 'gpt-5-nano'
-# MODEL_TYPE = 'gpt-5.2'
+# MODEL = 'openai'
+# # MODEL_TYPE = 'gpt-4o-mini'
+# MODEL_TYPE = 'gpt-5-nano'
+# # MODEL_TYPE = 'gpt-5.2'
+
+MODEL_TYPE_BY_PROVIDER = {
+    'gemini': 'gemini-2.5-flash',
+    'openai': 'gpt-4o-mini',
+    # 'openai': 'gpt-5-nano',
+    # 'openai': 'gpt-5.2',
+}
+
+
+def set_active_model(model_name):
+    """Set active provider and corresponding default model type."""
+    global MODEL, MODEL_TYPE
+    selected = (model_name or '').strip().lower()
+    if selected not in MODEL_TYPE_BY_PROVIDER:
+        raise ValueError(f"Unsupported model provider: {model_name}")
+    MODEL = selected
+    MODEL_TYPE = MODEL_TYPE_BY_PROVIDER[selected]
+    return MODEL, MODEL_TYPE
+
+
+def get_active_model():
+    """Return current provider and concrete model type."""
+    return MODEL, MODEL_TYPE
 
 
 def run_opensim_simulation(
@@ -297,11 +339,9 @@ def analyze_request_node(state):
             content = response.choices[0].message.content
 
         elif MODEL == 'gemini':
-            genai.configure(api_key=keys['gemini_api_key'])
-            model = genai.GenerativeModel(MODEL_TYPE)
-            response = model.generate_content(prompt)
+            content = _gemini_generate_text(keys['gemini_api_key'], MODEL_TYPE, prompt)
             # Gemini often adds markdown backticks, so we strip them
-            content = response.text.replace('```json', '').replace('```', '').strip()
+            content = content.replace('```json', '').replace('```', '').strip()
             
         else:
             return {"final_message": f"Error: Unknown MODEL configuration '{MODEL}'"}
@@ -398,11 +438,20 @@ def model_selection_node(state):
 
     # Load API Keys once
     try:
-        with open('info_and_keys.json') as f: keys = json.load(f)
-        if MODEL == 'openai': client = OpenAI(api_key=keys['openai_api_key'])
-        elif MODEL == 'gemini': genai.configure(api_key=keys['gemini_api_key'])
-    except:
-        return {"final_message": "Error: API Keys missing."}
+        with open('info_and_keys.json') as f:
+            keys = json.load(f)
+
+        if MODEL == 'openai':
+            openai_key = keys.get('openai_api_key', '')
+            if not openai_key or openai_key.strip() == '???':
+                return {"final_message": "Error: Missing openai_api_key in info_and_keys.json."}
+            client = OpenAI(api_key=openai_key)
+        elif MODEL == 'gemini':
+            gemini_key = keys.get('gemini_api_key', '')
+            if not gemini_key or gemini_key.strip() == '???':
+                return {"final_message": "Error: Missing gemini_api_key in info_and_keys.json."}
+    except Exception as e:
+        return {"final_message": f"Error loading API keys: {e}"}
 
     for attempt in range(1, max_retries + 1):
         print(f"-> Attempt {attempt}: Filtering...")
@@ -470,9 +519,8 @@ def model_selection_node(state):
                     )
                     content = response.choices[0].message.content
                 elif MODEL == 'gemini':
-                    model = genai.GenerativeModel("gemini-2.0-flash-exp")
-                    response = model.generate_content(prompt)
-                    content = response.text.replace('```json', '').replace('```', '').strip()
+                    content = _gemini_generate_text(keys['gemini_api_key'], MODEL_TYPE, prompt)
+                    content = content.replace('```json', '').replace('```', '').strip()
                 
                 # Apply new filters
                 new_filters = json.loads(content)
