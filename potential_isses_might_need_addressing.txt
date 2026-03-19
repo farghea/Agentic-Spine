@@ -1,9 +1,0 @@
-1. # creating agent envrionment, pip install -r requirements_agent.txt
-ERROR: Ignored the following versions that require a different python version: 0.1.0 Requires-Python >=3.9.0,<3.12; 0.1.1 Requires-Python >=3.9.0,<3.12; 0.1.2 Requires-Python >=3.9.0,<3.12; 0.5.12 Requires-Python >=3.7,<3.12; 0.5.13 Requires-Python >=3.7,<3.12; 1.21.2 Requires-Python >=3.7,<3.11; 1.21.3 Requires-Python >=3.7,<3.11; 1.21.4 Requires-Python >=3.7,<3.11; 1.21.5 Requires-Python >=3.7,<3.11; 1.21.6 Requires-Python >=3.7,<3.11
-ERROR: Could not find a version that satisfies the requirement pywin32==311 (from versions: none)
-ERROR: No matching distribution found for pywin32==311
-
-2. # creating agent envrionment, pip install -r requirements_agent.txt
-ERROR: Ignored the following versions that require a different python version: 9.11.0 Requires-Python >=3.12
-ERROR: Could not find a version that satisfies the requirement mkl-service==2.4.0 (from versions: 2.4.1, 2.4.2, 2.5.0, 2.5.2, 2.6.0, 2.6.1)
-ERROR: No matching distribution found for mkl-service==2.4.0
