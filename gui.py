@@ -5,16 +5,48 @@ import matplotlib.pyplot as plt
 import os  
 
 from main import app
-from utils import analysis_agent_node
+from utils import analysis_agent_node, set_active_model, get_active_model
 
 st.set_page_config(page_title="Biomechanics AI Agent", layout="wide")
 
 st.title("🦴 Biomechanics Agent")
 
+if "active_model" not in st.session_state:
+    st.session_state.active_model = get_active_model()[0]
+
+try:
+    set_active_model(st.session_state.active_model)
+except Exception:
+    st.session_state.active_model = "gemini"
+    set_active_model("gemini")
+
 # --- SIDEBAR: Configuration ---
 with st.sidebar:
     st.header("Settings")
-    st.write("Current Model: GPT-4o-mini")
+
+    left_col, right_col = st.columns(2)
+    with left_col:
+        if st.button(
+            "Use Gemini",
+            use_container_width=True,
+            type="primary" if st.session_state.active_model == "gemini" else "secondary",
+        ):
+            st.session_state.active_model = "gemini"
+            set_active_model("gemini")
+            st.rerun()
+
+    with right_col:
+        if st.button(
+            "Use OpenAI",
+            use_container_width=True,
+            type="primary" if st.session_state.active_model == "openai" else "secondary",
+        ):
+            st.session_state.active_model = "openai"
+            set_active_model("openai")
+            st.rerun()
+
+    active_provider, active_model_type = get_active_model()
+    st.write(f"Current Model: {active_provider.upper()} ({active_model_type})")
     
     # File Uploader
     uploaded_file = st.file_uploader("Upload custom .mot or .osim file", type=['mot', 'osim'])
