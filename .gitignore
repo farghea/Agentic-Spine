@@ -3,3 +3,7 @@
 
 # Ignore specific sensitive credential file
 info_and_keys.json
+
+# Ignore local requirements file that may different from main settings
+requirements_agent_local.txt
+requirements_opensim_local.txt
