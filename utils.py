@@ -150,6 +150,10 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_experimental.agents import create_pandas_dataframe_agent
 
 
+# --- Schemas for Agent Output ---
+from Schemas_Pydantic.analyze_request_schemas import SubjectFilter
+
+
 def _gemini_generate_text(api_key, model_name, prompt):
     """Generate plain text from Gemini using the google.genai SDK."""
     client = genai.Client(api_key=api_key)
@@ -290,6 +294,8 @@ def analyze_request_node(state):
             keys = json.load(f)
     except Exception as e:
         return {"final_message": f"Config Error: {e}"}
+    
+    # 2. Maintaining a Session State to tract output
 
     # 2. Build Prompt (SHARED for both models)
     prompt = f"""

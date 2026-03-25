@@ -26,6 +26,12 @@ class SubjectFilter(BaseModel):
         return self
     
 
+class AnalysisResult(BaseModel):
+    is_relevant: bool
+    subject_filter: SubjectFilter
+    activity_keys: list[str] = Field(description="List of activity keys that are relevant to the subject filter.")
+    verification: str = Field(description="A short status message for the user")
+
 if __name__ == "__main__":
 
     #--- Example Usage ---
