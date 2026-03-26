@@ -13,3 +13,8 @@ opensim_files/opensim_files/Output_Folder/
 
 # Ignore potential issues file that for remind personally to check and address, but not relevant to the codebase
 potential_isses_might_need_addressing.txt
+
+# Python Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
