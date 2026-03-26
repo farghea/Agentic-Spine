@@ -141,6 +141,7 @@ import io
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from pydantic import ValidationError
 from google import genai
 from openai import OpenAI
 
@@ -151,7 +152,11 @@ from langchain_experimental.agents import create_pandas_dataframe_agent
 
 
 # --- Schemas for Agent Output ---
-from Schemas_Pydantic.analyze_request_schemas import SubjectFilter
+from Schemas_Pydantic.analyze_request_schemas import SubjectFilter, AnalysisResult
+
+
+
+# --- Helper function to handle Gemini's response format ---
 
 
 def _gemini_generate_text(api_key, model_name, prompt):
@@ -295,11 +300,43 @@ def analyze_request_node(state):
     except Exception as e:
         return {"final_message": f"Config Error: {e}"}
     
-    # 2. Maintaining a Session State to tract output
+    # 2. Maintain partial extraction state that can be surfaced to the UI.
+    user_prompt = state.get('user_prompt', '')
+    followup_answer = (state.get('followup_answer') or '').strip()
+    partial_analysis = state.get('partial_analysis')
+    
+    clarification_suffix = ""
+    if followup_answer:
+        clarification_suffix = (
+            "\n\n### Additional user clarification\n"
+            f"{followup_answer}"
+        )
+    
+    # If we have a partial_analysis from a previous attempt, include it in the prompt
+    # to remind the LLM what it already extracted successfully
+    previous_extraction = ""
+    if partial_analysis:
+        prev_sex = partial_analysis.get('subject_filter', {}).get('sex')
+        prev_age = partial_analysis.get('subject_filter', {}).get('age_range')
+        prev_weight = partial_analysis.get('subject_filter', {}).get('weight_range')
+        prev_height = partial_analysis.get('subject_filter', {}).get('height_range')
+        prev_activities = partial_analysis.get('activity_keys')
+        
+        prev_parts = []
+        if prev_sex: prev_parts.append(f"Sex: {prev_sex}")
+        if prev_age: prev_parts.append(f"Age: {prev_age}")
+        if prev_weight: prev_parts.append(f"Weight: {prev_weight}")
+        if prev_height: prev_parts.append(f"Height: {prev_height}")
+        if prev_activities: prev_parts.append(f"Activities: {prev_activities}")
+        
+        if prev_parts:
+            previous_extraction = (
+                "\n\n### Previously extracted (keep these, update missing/incorrect):\n"
+                + "\n".join(prev_parts)
+            )
 
-    # 2. Build Prompt (SHARED for both models)
     prompt = f"""
-    You are an OpenSim expert. Analyze: "{state['user_prompt']}"
+    You are an OpenSim expert. Analyze: "{user_prompt}"
 
     ### TASK 1: Subject Filter
     - Extract constraints for Sex, Age, Weight, Height.
@@ -312,7 +349,11 @@ def analyze_request_node(state):
     - Match them exactly to strings in this list: {list(activity_dictionary.keys())}
     - If the user implies a category (e.g., "all lifting"), select all relevant keys.
 
-    ### Height should be in meter and weight in kilogram, so convert if needed. 
+    ### Height should be in meter and weight in kilogram, so convert if needed.
+    {previous_extraction}
+
+    ### If clarification is provided, use it as the most recent correction.
+    {clarification_suffix}
 
     ### OUTPUT JSON ONLY:
     {{
@@ -329,6 +370,21 @@ def analyze_request_node(state):
     """
 
     # 3. Call the Selected API
+    # Initialize session_state from partial_analysis if retrying a failed validation
+    if partial_analysis:
+        session_state = dict(partial_analysis)  # Start with what was extracted before
+    else:
+        session_state = {
+          "is_relevant": None,
+          "subject_filter": {
+              "sex": None,
+              "age_range": None,
+              "weight_range": None,
+              "height_range": None
+          },
+          "activity_keys": None,
+          "verification": None
+        }
     try:
         content = ""
 
@@ -345,22 +401,65 @@ def analyze_request_node(state):
             content = response.choices[0].message.content
 
         elif MODEL == 'gemini':
-            content = _gemini_generate_text(keys['gemini_api_key'], MODEL_TYPE, prompt)
-            # Gemini often adds markdown backticks, so we strip them
-            content = content.replace('```json', '').replace('```', '').strip()
-            
+            client = genai.Client(api_key=keys['gemini_api_key'])
+            response = client.models.generate_content(
+                model=MODEL_TYPE,
+                contents=prompt,
+                config={"response_mime_type": "application/json"}
+            )
+            content = response.text
         else:
             return {"final_message": f"Error: Unknown MODEL configuration '{MODEL}'"}
 
         # 4. Parse JSON (Common Step)
         result = json.loads(content)
-        
-        msg = f"Analyzed Request: {result.get('verification', 'Processing...')}"
-        return {"analysis_result": result, "current_status": msg}
+
+        for key, val in result.items():
+            if key == "is_relevant" and val is False:
+                return {"analysis_result": result, "final_message": "The request is not relevant to OpenSim analysis."}
+            if val is not None:
+                session_state[key] = val
+
+        validated_filter = AnalysisResult(**session_state)
+        validated_result = validated_filter.model_dump()
+        print("✅ Analysis Result:", validated_result)
+        msg = f"Analyzed Request: {validated_result.get('verification', 'Processing...')}"
+        return {"analysis_result": validated_result, "current_status": msg}
+
+    except ValidationError as e:
+        missing_fields = []
+        for err in e.errors():
+            loc = [str(part) for part in err.get("loc", [])]
+            if loc:
+                missing_fields.append(" -> ".join(loc))
+
+        unique_fields = sorted(set(missing_fields))
+        if unique_fields:
+            field_text = "\n".join([f"- {field_name}" for field_name in unique_fields])
+            followup_question = (
+                "I need a little more detail before running the simulation. "
+                "Please provide values for:\n"
+                f"{field_text}\n"
+                "You can answer in plain language, for example: "
+                "'male, age 40 to 45, weight 72 kg, height 1.70 m, Neutral standing'."
+            )
+        else:
+            followup_question = (
+                "I could not fully validate your request. "
+                "Please clarify sex, age range, weight range, height range, and activity."
+            )
+
+        print(f"Follow-up needed: {followup_question}")
+        return {
+            "needs_user_input": True,
+            "followup_question": followup_question,
+            "partial_analysis": session_state,
+            "current_status": "Awaiting user clarification.",
+            "final_message": followup_question
+        }
 
     except Exception as e:
-        print(f"API Error ({MODEL}): {e}")
-        return {"analysis_result": {"is_relevant": False}, "final_message": f"AI Error: {e}"}
+        return {"final_message": f"AI Error in request analysis: {e}"}
 
 
 

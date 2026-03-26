@@ -1,12 +1,11 @@
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator, field_validator
 from typing import Literal, Tuple, Annotated
 
 class SubjectFilter(BaseModel):
     # Literal ensures only these three strings are accepted
-    sex: Literal["male", "female", "any"]
+    sex: Literal["male", "female", "any"] = "any"
     
     # Using Tuple[float, float] represents the [min, max] structure
-    # We use Field to ensure the numbers are physically possible (e.g., non-negative)
     age_range: Tuple[Annotated[float, Field(ge=0)], Annotated[float, Field(ge=0)]]
     weight_range: Tuple[Annotated[float, Field(ge=0)], Annotated[float, Field(ge=0)]]
     height_range: Tuple[Annotated[float, Field(ge=0)], Annotated[float, Field(ge=0)]]
@@ -29,8 +28,19 @@ class SubjectFilter(BaseModel):
 class AnalysisResult(BaseModel):
     is_relevant: bool
     subject_filter: SubjectFilter
-    activity_keys: list[str] = Field(description="List of activity keys that are relevant to the subject filter.")
+    activity_keys: list[str] = Field(
+        min_length=1,
+        description="List of activity keys that are relevant to the subject filter."
+    )
     verification: str = Field(description="A short status message for the user")
+
+    @field_validator("activity_keys")
+    @classmethod
+    def validate_activity_keys(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        if not cleaned:
+            raise ValueError("activity_keys must be a non-empty list.")
+        return cleaned
 
 if __name__ == "__main__":
 
