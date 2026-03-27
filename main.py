@@ -7,6 +7,9 @@ import pandas as pd
 from typing import TypedDict, Literal, Optional, List
 from langgraph.graph import StateGraph, END
 
+# --- Langgraph Agent Graph PNG for report ---
+#from docs.langraphImage import save_graph_image
+
 # --- Import Nodes from utils ---
 from utils import (
     analyze_request_node, 
@@ -19,12 +22,16 @@ from utils import (
 # --- 1. Define the Agent State ---
 class AgentState(TypedDict):
     user_prompt: str     
+    followup_answer: Optional[str]
     analysis_result: Optional[dict]
+    partial_analysis: Optional[dict]
     selected_models: Optional[List[dict]]  
     simulation_output: Optional[List[dict]]
     dataframes: Optional[dict] 
     final_message: Optional[str]
-    current_status: Optional[str]        
+    current_status: Optional[str]
+    needs_user_input: Optional[bool]
+    followup_question: Optional[str]
 
 # --- 2. Define Routing Logic ---
 def route_request(state: AgentState) -> Literal["model_selector", "end"]:
