@@ -1,28 +1,19 @@
-from pydantic import BaseModel, Field, ValidationError, model_validator, field_validator
-from typing import Literal, Tuple, Annotated
+from pydantic import BaseModel, Field, field_validator
+from typing import Literal, Annotated
 
 class SubjectFilter(BaseModel):
     # Literal ensures only these three strings are accepted
     sex: Literal["male", "female", "any"] = "any"
     
-    # Using Tuple[float, float] represents the [min, max] structure
-    age_range: Tuple[Annotated[float, Field(ge=0)], Annotated[float, Field(ge=0)]]
-    weight_range: Tuple[Annotated[float, Field(ge=0)], Annotated[float, Field(ge=0)]]
-    height_range: Tuple[Annotated[float, Field(ge=0)], Annotated[float, Field(ge=0)]]
+    # Each filter is a numeric list sorted increasingly (single value or many).
+    age_range: list[Annotated[float, Field(ge=0)]] = Field(min_length=1)
+    weight_range: list[Annotated[float, Field(ge=0)]] = Field(min_length=1)
+    height_range: list[Annotated[float, Field(ge=0)]] = Field(min_length=1)
 
-    @model_validator(mode='after')
-    def validate_ranges(self) -> 'SubjectFilter':
-        """Ensures that in all [min, max] pairs, min <= max."""
-        ranges_to_check = {
-            "age": self.age_range,
-            "weight": self.weight_range,
-            "height": self.height_range
-        }
-        
-        for name, r in ranges_to_check.items():
-            if r[0] > r[1]:
-                raise ValueError(f"{name}_range min ({r[0]}) cannot be greater than max ({r[1]})")
-        return self
+    @field_validator("age_range", "weight_range", "height_range")
+    @classmethod
+    def sort_ranges_increasingly(cls, value: list[float]) -> list[float]:
+        return sorted(value)
     
 
 class AnalysisResult(BaseModel):
@@ -42,6 +33,30 @@ class AnalysisResult(BaseModel):
             raise ValueError("activity_keys must be a non-empty list.")
         return cleaned
 
+
+class RequestSplitResult(BaseModel):
+    simulation_request: str = Field(
+        min_length=1,
+        description="Prompt fragment containing subject/activity setup for simulation."
+    )
+    analysis_request: str = Field(
+        default="",
+        description="Optional post-simulation analysis question."
+    )
+
+    @field_validator("simulation_request", mode="before")
+    @classmethod
+    def normalize_simulation_request(cls, value) -> str:
+        text = str(value or "").strip()
+        if not text:
+            raise ValueError("simulation_request must be a non-empty string.")
+        return text
+
+    @field_validator("analysis_request", mode="before")
+    @classmethod
+    def normalize_analysis_request(cls, value) -> str:
+        return str(value or "").strip()
+
 if __name__ == "__main__":
 
     #--- Example Usage ---
@@ -56,15 +71,22 @@ if __name__ == "__main__":
     filter_obj = SubjectFilter(**valid_data)
     print("✅ Valid Filter:", filter_obj.model_dump())
 
-    # 2. This will FAIL because min > max
-    invalid_data = {
+    # 2. Unsorted values are accepted and normalized increasingly
+    unsorted_data = {
         "sex": "any",
-        "age_range": [80, 20], # Logical error
-        "weight_range": [70, 100],
-        "height_range": [160, 180]
+        "age_range": [80, 20],
+        "weight_range": [100, 70],
+        "height_range": [180, 160]
     }
+    normalized_filter = SubjectFilter(**unsorted_data)
+    print("✅ Normalized Filter:", normalized_filter.model_dump())
 
-    try:
-        SubjectFilter(**invalid_data)
-    except Exception as e:
-        print(f"\n❌ Validation Error: {e}")
+    # 3. Population variation: multiple age targets with shared height/weight
+    population_data = {
+        "sex": "female",
+        "age_range": [70, 60, 50],
+        "weight_range": [65],
+        "height_range": [1.62]
+    }
+    population_filter = SubjectFilter(**population_data)
+    print("✅ Population Filter:", population_filter.model_dump())

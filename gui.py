@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import os  
 
 from main import app
-from utils import analysis_agent_node, set_active_model, get_active_model
+from utils import code_generation_node, repl_execution_node, execution_output_node, router_node, set_active_model, get_active_model
 
 st.set_page_config(page_title="Biomechanics AI Agent", layout="wide")
 
@@ -63,6 +63,8 @@ if "simulation_done" not in st.session_state:
     st.session_state.simulation_done = False
 if "pending_followup" not in st.session_state:
     st.session_state.pending_followup = None
+if "analysis_request" not in st.session_state:
+    st.session_state.analysis_request = ""
 
 
 def run_simulation_pipeline(payload):
@@ -87,6 +89,36 @@ def run_simulation_pipeline(payload):
 
         status.update(label="Simulation Complete!", state="complete", expanded=False)
         return final_state
+
+
+def run_followup_analysis(payload):
+    """Run iterative code-generation analysis on existing simulation data only."""
+    state = {
+        "user_prompt": payload.get("user_prompt", ""),
+        "analysis_request": payload.get("analysis_request", payload.get("user_prompt", "")),
+        "dataframes": payload.get("dataframes", {}),
+        "chat_context": payload.get("chat_context", ""),
+        # Reset these for every new question to avoid cross-question carryover.
+        "iteratration_count": 0,
+        "code_history": [],
+        "code": "",
+        "text_result": "",
+        "raw_execution_logs": "",
+        "image_path": None,
+        "language_output": "",
+        "image_output": None,
+        "error_message": "",
+    }
+
+    while True:
+        state.update(code_generation_node(state))
+        if state.get("final_message") and not state.get("code"):
+            return state
+
+        state.update(repl_execution_node(state))
+        state.update(execution_output_node(state))
+        if router_node(state) == "end":
+            return state
 
 
 # --- SECTION 1: SIMULATION ---
@@ -118,6 +150,7 @@ if not st.session_state.simulation_done:
                     if final_state.get("dataframes"):
                         st.session_state.pending_followup = None
                         st.session_state.dataframes = final_state["dataframes"]
+                        st.session_state.analysis_request = final_state.get("analysis_request", "")
                         st.session_state.simulation_done = True
 
                         history_entry = {
@@ -156,6 +189,7 @@ if not st.session_state.simulation_done:
             if final_state.get("dataframes"):
                 st.session_state.pending_followup = None
                 st.session_state.dataframes = final_state["dataframes"]
+                st.session_state.analysis_request = final_state.get("analysis_request", "")
                 st.session_state.simulation_done = True
 
                 history_entry = {
@@ -191,6 +225,12 @@ if not st.session_state.simulation_done:
 # --- SECTION 2: ANALYSIS & PLOTTING ---
 else:
     st.subheader("2. Analysis Dashboard")
+
+    # Debug visibility for extracted analysis request from the original simulation prompt.
+    if st.session_state.analysis_request:
+        st.info(f"[DEBUG] Extracted analysis request: {st.session_state.analysis_request}")
+    else:
+        st.info("[DEBUG] Extracted analysis request: <empty>")
     
     # TABS
     tab1, tab2, tab3 = st.tabs(["💬 Chat Analysis", "📊 Data Explorer", "🔄 New Simulation"])
@@ -237,19 +277,23 @@ else:
 
                         state_payload = {
                             "user_prompt": prompt, 
+                            "analysis_request": prompt or st.session_state.analysis_request,
                             "dataframes": st.session_state.dataframes,
                             "chat_context": history_str 
                         }
+
+                        st.caption(f"[DEBUG] Active analysis request: {state_payload['analysis_request']}")
                         
-                        response = analysis_agent_node(state_payload)
+                        response = run_followup_analysis(state_payload)
                         answer = response["final_message"]
                         
                         st.markdown(answer)
                         
                         image_data = None
-                        if os.path.exists("static/generated_plot.png"):
+                        image_path = response.get("image_output")
+                        if image_path and os.path.exists(image_path):
                             try:
-                                with open("static/generated_plot.png", "rb") as img_file:
+                                with open(image_path, "rb") as img_file:
                                     image_data = img_file.read()
                                     st.image(image_data, caption="Agent Generated Plot")
                             except Exception as e:

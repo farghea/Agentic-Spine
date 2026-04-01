@@ -138,6 +138,9 @@ import json
 import subprocess
 import sys
 import io
+import contextlib
+import traceback
+import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -151,8 +154,13 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_experimental.agents import create_pandas_dataframe_agent
 
 
+
 # --- Schemas for Agent Output ---
-from Schemas_Pydantic.analyze_request_schemas import SubjectFilter, AnalysisResult
+from Schemas_Pydantic.analyze_request_schemas import SubjectFilter, AnalysisResult, RequestSplitResult
+
+
+# --- Data Formatting Tools ---
+from simulation_result_format.spinal_loads_data_formatter import tidy_spinal_loads_tool
 
 
 
@@ -177,9 +185,104 @@ def _gemini_generate_text(api_key, model_name, prompt):
                 parts.append(part_text)
     return "\n".join(parts)
 
+
+def _ensure_dataframe_bundle(raw_dataframes):
+    """Normalize state.dataframes into a dict of pandas DataFrames for robust analysis."""
+    bundle = raw_dataframes if isinstance(raw_dataframes, dict) else {}
+    normalized = {}
+    for key in ("spinal", "forces", "activations"):
+        value = bundle.get(key)
+        if isinstance(value, pd.DataFrame):
+            normalized[key] = value.copy()
+        elif isinstance(value, list):
+            normalized[key] = pd.DataFrame(value)
+        elif isinstance(value, dict):
+            normalized[key] = pd.DataFrame([value])
+        else:
+            normalized[key] = pd.DataFrame()
+    return normalized
+
+
+def _split_simulation_and_analysis_request(user_prompt):
+    """Split a mixed prompt into simulation extraction text and analysis question text."""
+    raw = str(user_prompt or "").strip()
+    if not raw:
+        return "", ""
+
+    compact = " ".join(raw.split())
+    match = re.search(r"(?i)\b(?:then\s+)?(?:analy[sz]e|analysis)\b", compact)
+    if not match:
+        return compact, ""
+
+    simulation_text = compact[:match.start()].strip(" ,.;")
+    analysis_text = compact[match.start():].strip()
+    return simulation_text, analysis_text
+
+
+def _llm_split_simulation_and_analysis_request(user_prompt, keys):
+    """Use the active LLM to separate simulation intent from analysis intent."""
+    raw = str(user_prompt or "").strip()
+    if not raw:
+        return "", ""
+
+    split_prompt = f"""
+You split OpenSim requests into two parts.
+
+User input:
+"{raw}"
+
+Return JSON only with this schema:
+{{
+  "simulation_request": "text for subject/activity simulation setup only",
+  "analysis_request": "text for post-simulation analysis question, empty string if missing"
+}}
+
+Rules:
+- Keep original wording when possible.
+- Put subject/activity/filter/model setup into simulation_request.
+- Put interpretation/comparison/summary/plot questions into analysis_request.
+- If user provides only simulation setup, set analysis_request to empty string.
+"""
+
+    try:
+        if MODEL == 'openai':
+            client = OpenAI(api_key=keys['openai_api_key'])
+            response = client.chat.completions.create(
+                model=MODEL_TYPE,
+                messages=[
+                    {"role": "system", "content": "You are a precise request parser. Output strictly valid JSON."},
+                    {"role": "user", "content": split_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0
+            )
+            content = response.choices[0].message.content
+        elif MODEL == 'gemini':
+            client = genai.Client(api_key=keys['gemini_api_key'])
+            response = client.models.generate_content(
+                model=MODEL_TYPE,
+                contents=split_prompt,
+                config={"response_mime_type": "application/json"}
+            )
+            content = response.text
+        else:
+            return _split_simulation_and_analysis_request(raw)
+
+        parsed = json.loads(content)
+        split_result = RequestSplitResult(**parsed)
+        sim = split_result.simulation_request
+        ana = split_result.analysis_request
+        if not sim:
+            sim = raw
+        return sim, ana
+
+    except Exception:
+        return _split_simulation_and_analysis_request(raw)
+
 MODEL = 'gemini'
-MODEL_TYPE = 'gemini-2.5-flash'
 #MODEL_TYPE = 'gemini-2.5-flash'
+
+MODEL_TYPE = 'gemini-3.1-flash-lite-preview'
 
 
 # MODEL = 'openai'
@@ -188,7 +291,7 @@ MODEL_TYPE = 'gemini-2.5-flash'
 # # MODEL_TYPE = 'gpt-5.2'
 
 MODEL_TYPE_BY_PROVIDER = {
-    'gemini': 'gemini-2.5-flash',
+    'gemini': 'gemini-3.1-flash-lite-preview',
     'openai': 'gpt-4o-mini',
     # 'openai': 'gpt-5-nano',
     # 'openai': 'gpt-5.2',
@@ -302,6 +405,8 @@ def analyze_request_node(state):
     
     # 2. Maintain partial extraction state that can be surfaced to the UI.
     user_prompt = state.get('user_prompt', '')
+    simulation_request, analysis_request = _llm_split_simulation_and_analysis_request(user_prompt, keys)
+    extraction_prompt = simulation_request or user_prompt
     followup_answer = (state.get('followup_answer') or '').strip()
     partial_analysis = state.get('partial_analysis')
     
@@ -336,13 +441,15 @@ def analyze_request_node(state):
             )
 
     prompt = f"""
-    You are an OpenSim expert. Analyze: "{user_prompt}"
+    You are an OpenSim expert. Analyze ONLY the simulation request below:
+    "{extraction_prompt}"
 
     ### TASK 1: Subject Filter
     - Extract constraints for Sex, Age, Weight, Height.
-    - Output standardized ranges [min, max]. 
-    - If "single subject", min and max are equal. 
-    - If "batch/group", use the range defined (use -1 if undefined).
+    - Output numeric lists (sorted increasingly) for age_range, weight_range, height_range.
+    - Lists can contain one or more values.
+    - For population comparison (e.g., ages 50, 60, 70), include all values in the relevant list.
+    - Use -1 when a metric is unspecified.
 
     ### TASK 2: Activity Matching
     - Identify ALL activities requested by the user.
@@ -360,9 +467,9 @@ def analyze_request_node(state):
       "is_relevant": true,
       "subject_filter": {{
           "sex": "male" | "female" | "any",
-          "age_range": [min, max],
-          "weight_range": [min, max],
-          "height_range": [min, max]
+                    "age_range": [number, ...],
+                    "weight_range": [number, ...],
+                    "height_range": [number, ...]
       }},
       "activity_keys": ["Activity Name 1", "Activity Name 2"],
       "verification": "Simulating [User's Subject] performing [Activity Count] tasks..."
@@ -424,7 +531,12 @@ def analyze_request_node(state):
         validated_result = validated_filter.model_dump()
         print("✅ Analysis Result:", validated_result)
         msg = f"Analyzed Request: {validated_result.get('verification', 'Processing...')}"
-        return {"analysis_result": validated_result, "current_status": msg}
+        return {
+            "analysis_result": validated_result,
+            "simulation_request": extraction_prompt,
+            "analysis_request": analysis_request,
+            "current_status": msg
+        }
 
     except ValidationError as e:
         missing_fields = []
@@ -496,6 +608,46 @@ def model_selection_node(state):
 
     # --- HELPER: Pure Python Filtering Logic ---
     def apply_filters(df_in, filters_in):
+        def normalize_values(values):
+            """Normalize scalar/list input into a sorted numeric list."""
+            if values is None:
+                return [-1.0]
+
+            if isinstance(values, (int, float)):
+                return [float(values)]
+
+            if isinstance(values, (list, tuple)):
+                if not values:
+                    return [-1.0]
+                try:
+                    return sorted(float(v) for v in values)
+                except (TypeError, ValueError):
+                    return [-1.0]
+
+            return [-1.0]
+
+        def bounds(values):
+            vals = normalize_values(values)
+            return vals[0], vals[-1]
+
+        def select_single_best(df_candidates, target_a, target_w, target_h):
+            scores = np.zeros(len(df_candidates))
+
+            if target_a != -1:
+                mid = (df_candidates['Min Age (year)'].values + df_candidates['Max Age (year)'].values) / 2
+                scores += np.abs(mid - target_a) / 10.0
+            if target_w != -1:
+                scores += np.abs(df_candidates['weight (kg)'].values - target_w) / 10.0
+            if target_h != -1:
+                scores += np.abs(df_candidates['height (m)'].values - target_h) / 0.10
+
+            best_idx = scores.argmin()
+            return df_candidates.iloc[[best_idx]]
+
+        age_values = normalize_values(filters_in.get('age_range'))
+        weight_values = normalize_values(filters_in.get('weight_range'))
+        height_values = normalize_values(filters_in.get('height_range'))
+
         # 1. Sex Filter
         if filters_in['sex'] != 'any':
             df_out = df_in[df_in['sex'].str.lower() == filters_in['sex'].lower()]
@@ -505,37 +657,51 @@ def model_selection_node(state):
         if df_out.empty: return df_out
 
         # 2. Check Mode
-        # If min != max for any metric, we treat it as a "Range/Batch" request
-        is_batch = (filters_in['age_range'][0] != filters_in['age_range'][1] or 
-                    filters_in['weight_range'][0] != filters_in['weight_range'][1] or 
-                    filters_in['height_range'][0] != filters_in['height_range'][1])
+        # If any metric has multiple requested values, do profile-wise best matching.
+        if len(age_values) > 1 or len(weight_values) > 1 or len(height_values) > 1:
+            profile_count = max(len(age_values), len(weight_values), len(height_values))
+
+            def expand(values, target_len):
+                if len(values) == target_len:
+                    return values
+                if len(values) == 1:
+                    return values * target_len
+                if len(values) < target_len:
+                    # Repeat the last provided value for shorter lists.
+                    return values + [values[-1]] * (target_len - len(values))
+                return values[:target_len]
+
+            ages = expand(age_values, profile_count)
+            weights = expand(weight_values, profile_count)
+            heights = expand(height_values, profile_count)
+
+            picks = []
+            for a, w, h in zip(ages, weights, heights):
+                picks.append(select_single_best(df_out, a, w, h))
+            return pd.concat(picks, ignore_index=True)
+
+        age_mn, age_mx = bounds(age_values)
+        weight_mn, weight_mx = bounds(weight_values)
+        height_mn, height_mx = bounds(height_values)
+        is_batch = (age_mn != age_mx or weight_mn != weight_mx or height_mn != height_mx)
         
         if is_batch:
             mask = pd.Series(True, index=df_out.index)
             # Age
-            mn, mx = filters_in['age_range']
+            mn, mx = age_mn, age_mx
             if mn != -1: mask &= (df_out['Min Age (year)'] <= mx) & (df_out['Max Age (year)'] >= mn)
             # Weight
-            mn, mx = filters_in['weight_range']
+            mn, mx = weight_mn, weight_mx
             if mn != -1: mask &= (df_out['weight (kg)'] >= mn) & (df_out['weight (kg)'] <= mx)
             # Height
-            mn, mx = filters_in['height_range']
+            mn, mx = height_mn, height_mx
             if mn != -1: mask &= (df_out['height (m)'] >= mn) & (df_out['height (m)'] <= mx)
             return df_out[mask]
         
         else:
             # Single Best Match Logic (Distance Metric)
-            target_a, target_w, target_h = filters_in['age_range'][0], filters_in['weight_range'][0], filters_in['height_range'][0]
-            scores = np.zeros(len(df_out))
-            
-            if target_a != -1:
-                mid = (df_out['Min Age (year)'].values + df_out['Max Age (year)'].values) / 2
-                scores += np.abs(mid - target_a) / 10.0
-            if target_w != -1: scores += np.abs(df_out['weight (kg)'].values - target_w) / 10.0
-            if target_h != -1: scores += np.abs(df_out['height (m)'].values - target_h) / 0.10
-            
-            best_idx = scores.argmin()
-            return df_out.iloc[[best_idx]]
+            target_a, target_w, target_h = age_mn, weight_mn, height_mn
+            return select_single_best(df_out, target_a, target_w, target_h)
 
     # --- REFLECTION LOOP ---
     max_retries = 3
@@ -647,7 +813,7 @@ def model_selection_node(state):
         clean_path = f"{str(raw_dir).replace('\\', '/').lstrip('./')}/{row['Filename']}"
         results.append({**row.to_dict(), "full_path": clean_path})
 
-    msg = f"Model Selection Complete. Found {len(results)} model(s)."
+    msg = f"Model Selection Complete. Found {len(results)} model(s). \n The simulation is result {results}"
     return {"selected_models": results, "current_status": msg}
 
 
@@ -758,19 +924,21 @@ def data_processing_node(state):
     print("--- Node 4: Processing Results to DataFrames ---")
     
     sim_outputs = state.get('simulation_output', [])
+    if not isinstance(sim_outputs, list):
+        sim_outputs = []
     models = state.get('selected_models', [])
 
     # ===== TEMP DEBUG START: save a local copy of raw simulation output =====
     # This is intentionally temporary so sim_outputs can be reviewed offline.
-    # try:
-    #     debug_dir = os.path.join(os.getcwd(), 'debug_outputs')
-    #     os.makedirs(debug_dir, exist_ok=True)
-    #     debug_path = os.path.join(debug_dir, 'latest_sim_outputs.json')
-    #     with open(debug_path, 'w', encoding='utf-8') as f:
-    #         json.dump(sim_outputs, f, indent=2, default=str)
-    #     print(f"[TEMP DEBUG] sim_outputs saved to: {debug_path}")
-    # except Exception as e:
-    #     print(f"[TEMP DEBUG] Failed to save sim_outputs: {e}")
+    try:
+        debug_dir = os.path.join(os.getcwd(), 'debug_outputs')
+        os.makedirs(debug_dir, exist_ok=True)
+        debug_path = os.path.join(debug_dir, 'latest_sim_outputs.json')
+        with open(debug_path, 'w', encoding='utf-8') as f:
+            json.dump(sim_outputs, f, indent=2, default=str)
+        print(f"[TEMP DEBUG] sim_outputs saved to: {debug_path}")
+    except Exception as e:
+        print(f"[TEMP DEBUG] Failed to save sim_outputs: {e}")
     # ===== TEMP DEBUG END =====
     
     # 1. Create a lookup for model demographics
@@ -785,6 +953,7 @@ def data_processing_node(state):
 
     # 2. Lists to hold rows
     spinal_data, force_data, activation_data = [], [], []
+    tidy_spinal_frames = []
 
     # 3. Helper to process dictionary to list of rows
     def extract_rows(base_info, data_dict, category_col, target_list):
@@ -815,15 +984,265 @@ def data_processing_node(state):
         extract_rows(base_row, results.get('muscle_forces'), 'Muscle_Name', force_data)
         extract_rows(base_row, results.get('muscle_activations'), 'Muscle_Name', activation_data)
 
+        # Build a tidy spinal table per run when raw spinal loads are available.
+        spinal_loads = results.get('spinal_loads')
+        if isinstance(spinal_loads, dict) and spinal_loads:
+            tidy_df = tidy_spinal_loads_tool(spinal_loads)
+            tidy_df.insert(0, 'Model', model_name)
+            tidy_df.insert(1, 'Activity', run['activity'])
+            tidy_df.insert(2, 'Age', demos.get('age'))
+            tidy_df.insert(3, 'Weight_kg', demos.get('weight'))
+            tidy_df.insert(4, 'Height_m', demos.get('height'))
+            tidy_spinal_frames.append(tidy_df)
+
+    if tidy_spinal_frames:
+        tidy_spinal = pd.concat(tidy_spinal_frames, ignore_index=True)
+    elif spinal_data:
+        tidy_spinal = pd.DataFrame(spinal_data)
+    else:
+        tidy_spinal = pd.DataFrame()
+
     # 5. Return DataFrames in state
     return {
         "dataframes": {
-            "spinal": pd.DataFrame(spinal_data),
+            #"spinal": pd.DataFrame(spinal_data),
+            "spinal": tidy_spinal,
             "forces": pd.DataFrame(force_data),
             "activations": pd.DataFrame(activation_data)
         },
         "current_status": "Data processed into DataFrames."
     }
+
+
+def code_generation_node(state):
+    """
+    Node 5: The 'Coder'. Generates Python code to analyze the DataFrames.
+    """
+    print(f"--- Node 5: LLM is Writting Code According to Your Instructions ({MODEL}) for Iteration {state.get('iteratration_count', 0)+1}    ---")
+    
+    # 2. Context
+    previous_code = (state.get('code') or '').strip()
+    if previous_code:
+        print("[DEBUG] Previous generated code before retry:")
+        print(previous_code)
+
+    chat_history = state.get('chat_context', "")
+    analysis_query = (state.get('analysis_request') or state.get('user_prompt') or '').strip()
+    if not analysis_query:
+        analysis_query = "Summarize key findings from spinal loads and highlight the largest compression value."
+    normalized_dfs = _ensure_dataframe_bundle(state.get('dataframes'))
+    spinal = normalized_dfs.get('spinal')
+    force = normalized_dfs.get('forces')
+    activation = normalized_dfs.get('activations')
+
+    def _format_columns(df):
+        if isinstance(df, pd.DataFrame):
+            return ', '.join(map(str, df.columns.tolist())) or 'none'
+        return 'none'
+
+    def _format_sample(df, name):
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return f"{name}: EMPTY"
+        sample = df.head(5).to_string(index=False)
+        return f"{name} (first 5 rows):\n{sample}"
+
+    spinal_cols = _format_columns(spinal)
+    force_cols = _format_columns(force)
+    activation_cols = _format_columns(activation)
+    spinal_sample = _format_sample(spinal, "spinal")
+    force_sample = _format_sample(force, "forces")
+    activation_sample = _format_sample(activation, "activations")
+
+    system_prompt = f"""
+    You are an expert Bio-Mechanical Data Analyst specializing in spinal kinematics and muscle dynamics. 
+    Your goal is to provide executable Python code to analyze biomechanical datasets.
+
+    ### DATASET ARCHITECTURE:
+    - Data is available from `state.get('dataframes', {{}})` and normalized to pandas DataFrames before code generation.
+    - 'spinal': Contains spinal load data with columns {spinal_cols}.
+    - 'forces': Contains muscle force data with columns {force_cols}.
+    - 'activations': Contains muscle activation data with columns {activation_cols}.
+
+    ### DATA SAMPLES (use these to infer structure and types):
+    {spinal_sample}
+
+    {force_sample}
+
+    {activation_sample}
+
+    ### BIOMECHANICAL DOMAIN KNOWLEDGE:
+    - Spinal loads are in Newtons. For vertebral load vectors, fy is typically compression/distraction axis and fx/fz represent shear components.
+    - Larger absolute compression magnitudes indicate higher disc/joint loading demand.
+    - Muscle force values are in Newtons and reflect estimated tension production by each muscle element.
+    - Muscle activation values are unitless (approximately 0 to 1), where larger values indicate higher neural drive.
+    - If both force and activation are available, discuss them together: high activation with low force can indicate short moment arm or unfavorable mechanics.
+    - When comparing conditions, clearly report the condition labels (for example Model, Activity, joint_level, Muscle_Name) and numeric deltas.
+
+    "STRICT RULES:\n"
+    "1. Always use pandas for data loading.\n"
+    "2. If the task requires a visual, use matplotlib/seaborn and SAVE it as 'static/generated_plot.png'.\n"
+    "3. NEVER use plt.show(). Use plt.savefig('static/generated_plot.png') instead.\n"
+    "4. Always print() your findings in plain language.\n"
+    "5. Your final print line MUST start with 'SUMMARY:' and include key numeric findings.\n"
+    "6. Respond ONLY with raw code (no markdown blocks)."
+    """
+
+    if chat_history:
+        system_prompt += f"\n\n### RECENT CHAT CONTEXT:\n{chat_history}"
+
+    system_prompt += f"\n\n### USER QUESTION:\n{analysis_query}"
+    
+        # 1. Load Keys & Init LLM
+    try:
+        with open('info_and_keys.json') as f: 
+            keys = json.load(f)
+        
+        if MODEL == 'openai':
+            llm = ChatOpenAI(
+                model=MODEL_TYPE, 
+                api_key=keys["openai_api_key"], 
+                temperature=0
+            )
+        elif MODEL == 'gemini':
+            llm = ChatGoogleGenerativeAI(
+                model=MODEL_TYPE, 
+                google_api_key=keys["gemini_api_key"], 
+                temperature=0
+            )
+        else:
+            return {"final_message": f"Error: Unknown MODEL configuration '{MODEL}'"}
+            
+    except Exception as e:
+        return {"final_message": f"Config/LLM Init Error: {e}"}
+    
+
+    response = llm.invoke(system_prompt)
+    response_text = getattr(response, "text", None) or getattr(response, "content", "")
+    if isinstance(response_text, list):
+        response_text = "\n".join(map(str, response_text))
+    clean_code = str(response_text).replace("```python", "").replace("```", "").strip()
+
+    if not clean_code:
+        return {"final_message": "Code generation returned empty output."}
+
+    prior_history = state.get("code_history") or []
+    updated_history = prior_history + [clean_code]
+    return {
+        "code": clean_code,
+        "code_history": updated_history,
+        "dataframes": normalized_dfs,
+        "iteratration_count": state.get("iteratration_count", 0) + 1,
+    }
+
+def repl_execution_node(state):
+    """
+    Node 6: The 'Executor'. Executes generated code in a safe REPL environment.
+    """
+    print(f"--- Node 6: REPL Execution Placeholder ({MODEL}) for Iteration {state.get('iteratration_count', 0)} ---")
+    
+    # For now, we just return a message. The actual implementation would involve:
+    # 1. Taking generated code from state['generated_code']
+    # 2. Executing it in a Python REPL environment with access to state['dataframes']
+    # 3. Capturing output and returning it to the user.
+    # Pre-run cleanup
+    if os.path.exists("output_chart.png"):
+        os.remove("output_chart.png")
+    if os.path.exists("static/generated_plot.png"):
+        os.remove("static/generated_plot.png")
+
+    try:
+        code_to_run = state.get("code", "")
+        if not code_to_run:
+            return {"error_message": "No generated code found in state.", "final_message": "No generated code found in state."}
+
+        dfs = _ensure_dataframe_bundle(state.get("dataframes"))
+        exec_globals = {"pd": pd, "np": np, "plt": plt}
+        safe_state = {
+            "dataframes": dfs,
+            "analysis_request": state.get("analysis_request", ""),
+            "user_prompt": state.get("user_prompt", ""),
+        }
+        exec_locals = {
+            "state": safe_state,
+            "dfs": dfs,
+            "spinal": dfs.get("spinal"),
+            "forces": dfs.get("forces"),
+            "activations": dfs.get("activations"),
+            "df_spinal": dfs.get("spinal"),
+            "df_forces": dfs.get("forces"),
+            "df_activations": dfs.get("activations"),
+        }
+
+        stdout_buffer = io.StringIO()
+        with contextlib.redirect_stdout(stdout_buffer):
+            exec(code_to_run, exec_globals, exec_locals)
+
+        logs = stdout_buffer.getvalue().strip()
+        has_image = "static/generated_plot.png" if os.path.exists("static/generated_plot.png") else (
+            "output_chart.png" if os.path.exists("output_chart.png") else None
+        )
+        final_text = logs or "Analysis completed successfully."
+
+        print("✅ Execution successful.")
+        return {
+            "error_message": "",
+            "text_result": final_text,
+            "image_path": has_image,
+            "raw_execution_logs": final_text,
+        }
+
+    except Exception:
+        err = traceback.format_exc()
+        print("❌ Code failed. Sending error back to LLM.")
+        return {"error_message": err, "raw_execution_logs": ""}
+
+
+def execution_output_node(state):
+    """
+    Node 7: Convert raw execution artifacts into user-facing language and image outputs.
+    """
+    print(f"--- Node 7: Execution Output Processor ({MODEL}) ---")
+
+    error_msg = (state.get("error_message") or "").strip()
+    if error_msg:
+        return {
+            "language_output": "",
+            "image_output": None,
+            "final_message": error_msg,
+            "current_status": "Execution failed. Retrying with updated code.",
+        }
+
+    text_result = (state.get("text_result") or state.get("raw_execution_logs") or "").strip()
+    image_output = state.get("image_path")
+
+    if not text_result and image_output:
+        text_result = "Plot generated successfully."
+    elif not text_result:
+        text_result = "Analysis completed successfully."
+
+    return {
+        "language_output": text_result,
+        "image_output": image_output,
+        "final_message": text_result,
+        "current_status": "Analysis response ready.",
+    }
+
+
+def router_node(state):
+    """
+    Node 7: The 'Router'. Decides whether to send the user back to the Coder or REPL based on their needs.
+    This is a placeholder for where you would implement logic to route the user appropriately.
+    """
+    print(f"--- Node 7: Router Placeholder ({MODEL}) ---")
+    
+    # For now, we just return a message. The actual implementation would involve:
+    # 1. Analyzing user needs from state['user_prompt'] or other context
+    # 2. Deciding whether they need more code generation (send back to Coder) or execution (send to REPL)
+    # 3. Returning routing information in the state for the UI to handle.
+
+    if not state.get("error_message") or state.get("iteratration_count", 0) >= 3:
+        return "end"
+    return "retry"
 
 
 
