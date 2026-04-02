@@ -1014,6 +1014,9 @@ def data_processing_node(state):
     }
 
 
+# maybe a planner to plan out the analysis
+
+
 def code_generation_node(state):
     """
     Node 5: The 'Coder'. Generates Python code to analyze the DataFrames.
