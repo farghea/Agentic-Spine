@@ -138,10 +138,14 @@ import json
 import subprocess
 import sys
 import io
+import contextlib
+import traceback
+import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import google.generativeai as genai
+from pydantic import ValidationError
+from google import genai
 from openai import OpenAI
 
 # --- MISSING IMPORTS CAUSING YOUR ERROR ---
@@ -149,15 +153,165 @@ from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_experimental.agents import create_pandas_dataframe_agent
 
-# MODEL = 'gemini'
-# MODEL_TYPE = 'gemini-2.5-flash-lite'
-# MODEL_TYPE = 'gemini-2.5-flash'
 
 
-MODEL = 'openai'
-# MODEL_TYPE = 'gpt-4o-mini'
-MODEL_TYPE = 'gpt-5-nano'
-# MODEL_TYPE = 'gpt-5.2'
+# --- Schemas for Agent Output ---
+from Schemas_Pydantic.analyze_request_schemas import SubjectFilter, AnalysisResult, RequestSplitResult
+
+
+# --- Data Formatting Tools ---
+from simulation_result_format.spinal_loads_data_formatter import tidy_spinal_loads_tool
+
+
+
+# --- Helper function to handle Gemini's response format ---
+
+
+def _gemini_generate_text(api_key, model_name, prompt):
+    """Generate plain text from Gemini using the google.genai SDK."""
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(model=model_name, contents=prompt)
+    text = getattr(response, "text", None)
+    if text:
+        return text
+
+    # Fallback for responses where text is segmented into parts.
+    parts = []
+    for candidate in getattr(response, "candidates", []) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", []) or []:
+            part_text = getattr(part, "text", None)
+            if part_text:
+                parts.append(part_text)
+    return "\n".join(parts)
+
+
+def _ensure_dataframe_bundle(raw_dataframes):
+    """Normalize state.dataframes into a dict of pandas DataFrames for robust analysis."""
+    bundle = raw_dataframes if isinstance(raw_dataframes, dict) else {}
+    normalized = {}
+    for key in ("spinal", "forces", "activations"):
+        value = bundle.get(key)
+        if isinstance(value, pd.DataFrame):
+            normalized[key] = value.copy()
+        elif isinstance(value, list):
+            normalized[key] = pd.DataFrame(value)
+        elif isinstance(value, dict):
+            normalized[key] = pd.DataFrame([value])
+        else:
+            normalized[key] = pd.DataFrame()
+    return normalized
+
+
+def _split_simulation_and_analysis_request(user_prompt):
+    """Split a mixed prompt into simulation extraction text and analysis question text."""
+    raw = str(user_prompt or "").strip()
+    if not raw:
+        return "", ""
+
+    compact = " ".join(raw.split())
+    match = re.search(r"(?i)\b(?:then\s+)?(?:analy[sz]e|analysis)\b", compact)
+    if not match:
+        return compact, ""
+
+    simulation_text = compact[:match.start()].strip(" ,.;")
+    analysis_text = compact[match.start():].strip()
+    return simulation_text, analysis_text
+
+
+def _llm_split_simulation_and_analysis_request(user_prompt, keys):
+    """Use the active LLM to separate simulation intent from analysis intent."""
+    raw = str(user_prompt or "").strip()
+    if not raw:
+        return "", ""
+
+    split_prompt = f"""
+You split OpenSim requests into two parts.
+
+User input:
+"{raw}"
+
+Return JSON only with this schema:
+{{
+  "simulation_request": "text for subject/activity simulation setup only",
+  "analysis_request": "text for post-simulation analysis question, empty string if missing"
+}}
+
+Rules:
+- Keep original wording when possible.
+- Put subject/activity/filter/model setup into simulation_request.
+- Put interpretation/comparison/summary/plot questions into analysis_request.
+- If user provides only simulation setup, set analysis_request to empty string.
+"""
+
+    try:
+        if MODEL == 'openai':
+            client = OpenAI(api_key=keys['openai_api_key'])
+            response = client.chat.completions.create(
+                model=MODEL_TYPE,
+                messages=[
+                    {"role": "system", "content": "You are a precise request parser. Output strictly valid JSON."},
+                    {"role": "user", "content": split_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0
+            )
+            content = response.choices[0].message.content
+        elif MODEL == 'gemini':
+            client = genai.Client(api_key=keys['gemini_api_key'])
+            response = client.models.generate_content(
+                model=MODEL_TYPE,
+                contents=split_prompt,
+                config={"response_mime_type": "application/json"}
+            )
+            content = response.text
+        else:
+            return _split_simulation_and_analysis_request(raw)
+
+        parsed = json.loads(content)
+        split_result = RequestSplitResult(**parsed)
+        sim = split_result.simulation_request
+        ana = split_result.analysis_request
+        if not sim:
+            sim = raw
+        return sim, ana
+
+    except Exception:
+        return _split_simulation_and_analysis_request(raw)
+
+MODEL = 'gemini'
+#MODEL_TYPE = 'gemini-2.5-flash'
+
+MODEL_TYPE = 'gemini-3.1-flash-lite-preview'
+
+
+# MODEL = 'openai'
+# # MODEL_TYPE = 'gpt-4o-mini'
+# MODEL_TYPE = 'gpt-5-nano'
+# # MODEL_TYPE = 'gpt-5.2'
+
+MODEL_TYPE_BY_PROVIDER = {
+    'gemini': 'gemini-3.1-flash-lite-preview',
+    'openai': 'gpt-4o-mini',
+    # 'openai': 'gpt-5-nano',
+    # 'openai': 'gpt-5.2',
+}
+
+
+def set_active_model(model_name):
+    """Set active provider and corresponding default model type."""
+    global MODEL, MODEL_TYPE
+    selected = (model_name or '').strip().lower()
+    if selected not in MODEL_TYPE_BY_PROVIDER:
+        raise ValueError(f"Unsupported model provider: {model_name}")
+    MODEL = selected
+    MODEL_TYPE = MODEL_TYPE_BY_PROVIDER[selected]
+    return MODEL, MODEL_TYPE
+
+
+def get_active_model():
+    """Return current provider and concrete model type."""
+    return MODEL, MODEL_TYPE
 
 
 def run_opensim_simulation(
@@ -248,32 +402,74 @@ def analyze_request_node(state):
             keys = json.load(f)
     except Exception as e:
         return {"final_message": f"Config Error: {e}"}
+    
+    # 2. Maintain partial extraction state that can be surfaced to the UI.
+    user_prompt = state.get('user_prompt', '')
+    simulation_request, analysis_request = _llm_split_simulation_and_analysis_request(user_prompt, keys)
+    extraction_prompt = simulation_request or user_prompt
+    followup_answer = (state.get('followup_answer') or '').strip()
+    partial_analysis = state.get('partial_analysis')
+    
+    clarification_suffix = ""
+    if followup_answer:
+        clarification_suffix = (
+            "\n\n### Additional user clarification\n"
+            f"{followup_answer}"
+        )
+    
+    # If we have a partial_analysis from a previous attempt, include it in the prompt
+    # to remind the LLM what it already extracted successfully
+    previous_extraction = ""
+    if partial_analysis:
+        prev_sex = partial_analysis.get('subject_filter', {}).get('sex')
+        prev_age = partial_analysis.get('subject_filter', {}).get('age_range')
+        prev_weight = partial_analysis.get('subject_filter', {}).get('weight_range')
+        prev_height = partial_analysis.get('subject_filter', {}).get('height_range')
+        prev_activities = partial_analysis.get('activity_keys')
+        
+        prev_parts = []
+        if prev_sex: prev_parts.append(f"Sex: {prev_sex}")
+        if prev_age: prev_parts.append(f"Age: {prev_age}")
+        if prev_weight: prev_parts.append(f"Weight: {prev_weight}")
+        if prev_height: prev_parts.append(f"Height: {prev_height}")
+        if prev_activities: prev_parts.append(f"Activities: {prev_activities}")
+        
+        if prev_parts:
+            previous_extraction = (
+                "\n\n### Previously extracted (keep these, update missing/incorrect):\n"
+                + "\n".join(prev_parts)
+            )
 
-    # 2. Build Prompt (SHARED for both models)
     prompt = f"""
-    You are an OpenSim expert. Analyze: "{state['user_prompt']}"
+    You are an OpenSim expert. Analyze ONLY the simulation request below:
+    "{extraction_prompt}"
 
     ### TASK 1: Subject Filter
     - Extract constraints for Sex, Age, Weight, Height.
-    - Output standardized ranges [min, max]. 
-    - If "single subject", min and max are equal. 
-    - If "batch/group", use the range defined (use -1 if undefined).
+    - Output numeric lists (sorted increasingly) for age_range, weight_range, height_range.
+    - Lists can contain one or more values.
+    - For population comparison (e.g., ages 50, 60, 70), include all values in the relevant list.
+    - Use -1 when a metric is unspecified.
 
     ### TASK 2: Activity Matching
     - Identify ALL activities requested by the user.
     - Match them exactly to strings in this list: {list(activity_dictionary.keys())}
     - If the user implies a category (e.g., "all lifting"), select all relevant keys.
 
-    ### Height should be in meter and weight in kilogram, so convert if needed. 
+    ### Height should be in meter and weight in kilogram, so convert if needed.
+    {previous_extraction}
+
+    ### If clarification is provided, use it as the most recent correction.
+    {clarification_suffix}
 
     ### OUTPUT JSON ONLY:
     {{
       "is_relevant": true,
       "subject_filter": {{
           "sex": "male" | "female" | "any",
-          "age_range": [min, max],
-          "weight_range": [min, max],
-          "height_range": [min, max]
+                    "age_range": [number, ...],
+                    "weight_range": [number, ...],
+                    "height_range": [number, ...]
       }},
       "activity_keys": ["Activity Name 1", "Activity Name 2"],
       "verification": "Simulating [User's Subject] performing [Activity Count] tasks..."
@@ -281,6 +477,21 @@ def analyze_request_node(state):
     """
 
     # 3. Call the Selected API
+    # Initialize session_state from partial_analysis if retrying a failed validation
+    if partial_analysis:
+        session_state = dict(partial_analysis)  # Start with what was extracted before
+    else:
+        session_state = {
+          "is_relevant": None,
+          "subject_filter": {
+              "sex": None,
+              "age_range": None,
+              "weight_range": None,
+              "height_range": None
+          },
+          "activity_keys": None,
+          "verification": None
+        }
     try:
         content = ""
 
@@ -297,24 +508,70 @@ def analyze_request_node(state):
             content = response.choices[0].message.content
 
         elif MODEL == 'gemini':
-            genai.configure(api_key=keys['gemini_api_key'])
-            model = genai.GenerativeModel(MODEL_TYPE)
-            response = model.generate_content(prompt)
-            # Gemini often adds markdown backticks, so we strip them
-            content = response.text.replace('```json', '').replace('```', '').strip()
-            
+            client = genai.Client(api_key=keys['gemini_api_key'])
+            response = client.models.generate_content(
+                model=MODEL_TYPE,
+                contents=prompt,
+                config={"response_mime_type": "application/json"}
+            )
+            content = response.text
         else:
             return {"final_message": f"Error: Unknown MODEL configuration '{MODEL}'"}
 
         # 4. Parse JSON (Common Step)
         result = json.loads(content)
-        
-        msg = f"Analyzed Request: {result.get('verification', 'Processing...')}"
-        return {"analysis_result": result, "current_status": msg}
+
+        for key, val in result.items():
+            if key == "is_relevant" and val is False:
+                return {"analysis_result": result, "final_message": "The request is not relevant to OpenSim analysis."}
+            if val is not None:
+                session_state[key] = val
+
+        validated_filter = AnalysisResult(**session_state)
+        validated_result = validated_filter.model_dump()
+        print("✅ Analysis Result:", validated_result)
+        msg = f"Analyzed Request: {validated_result.get('verification', 'Processing...')}"
+        return {
+            "analysis_result": validated_result,
+            "simulation_request": extraction_prompt,
+            "analysis_request": analysis_request,
+            "current_status": msg
+        }
+
+    except ValidationError as e:
+        missing_fields = []
+        for err in e.errors():
+            loc = [str(part) for part in err.get("loc", [])]
+            if loc:
+                missing_fields.append(" -> ".join(loc))
+
+        unique_fields = sorted(set(missing_fields))
+        if unique_fields:
+            field_text = "\n".join([f"- {field_name}" for field_name in unique_fields])
+            followup_question = (
+                "I need a little more detail before running the simulation. "
+                "Please provide values for:\n"
+                f"{field_text}\n"
+                "You can answer in plain language, for example: "
+                "'male, age 40 to 45, weight 72 kg, height 1.70 m, Neutral standing'."
+            )
+        else:
+            followup_question = (
+                "I could not fully validate your request. "
+                "Please clarify sex, age range, weight range, height range, and activity."
+            )
+
+        print(f"Follow-up needed: {followup_question}")
+        return {
+            "needs_user_input": True,
+            "followup_question": followup_question,
+            "partial_analysis": session_state,
+            "current_status": "Awaiting user clarification.",
+            "final_message": followup_question
+        }
 
     except Exception as e:
-        print(f"API Error ({MODEL}): {e}")
-        return {"analysis_result": {"is_relevant": False}, "final_message": f"AI Error: {e}"}
+        return {"final_message": f"AI Error in request analysis: {e}"}
 
 
 
@@ -351,6 +608,46 @@ def model_selection_node(state):
 
     # --- HELPER: Pure Python Filtering Logic ---
     def apply_filters(df_in, filters_in):
+        def normalize_values(values):
+            """Normalize scalar/list input into a sorted numeric list."""
+            if values is None:
+                return [-1.0]
+
+            if isinstance(values, (int, float)):
+                return [float(values)]
+
+            if isinstance(values, (list, tuple)):
+                if not values:
+                    return [-1.0]
+                try:
+                    return sorted(float(v) for v in values)
+                except (TypeError, ValueError):
+                    return [-1.0]
+
+            return [-1.0]
+
+        def bounds(values):
+            vals = normalize_values(values)
+            return vals[0], vals[-1]
+
+        def select_single_best(df_candidates, target_a, target_w, target_h):
+            scores = np.zeros(len(df_candidates))
+
+            if target_a != -1:
+                mid = (df_candidates['Min Age (year)'].values + df_candidates['Max Age (year)'].values) / 2
+                scores += np.abs(mid - target_a) / 10.0
+            if target_w != -1:
+                scores += np.abs(df_candidates['weight (kg)'].values - target_w) / 10.0
+            if target_h != -1:
+                scores += np.abs(df_candidates['height (m)'].values - target_h) / 0.10
+
+            best_idx = scores.argmin()
+            return df_candidates.iloc[[best_idx]]
+
+        age_values = normalize_values(filters_in.get('age_range'))
+        weight_values = normalize_values(filters_in.get('weight_range'))
+        height_values = normalize_values(filters_in.get('height_range'))
+
         # 1. Sex Filter
         if filters_in['sex'] != 'any':
             df_out = df_in[df_in['sex'].str.lower() == filters_in['sex'].lower()]
@@ -360,37 +657,51 @@ def model_selection_node(state):
         if df_out.empty: return df_out
 
         # 2. Check Mode
-        # If min != max for any metric, we treat it as a "Range/Batch" request
-        is_batch = (filters_in['age_range'][0] != filters_in['age_range'][1] or 
-                    filters_in['weight_range'][0] != filters_in['weight_range'][1] or 
-                    filters_in['height_range'][0] != filters_in['height_range'][1])
+        # If any metric has multiple requested values, do profile-wise best matching.
+        if len(age_values) > 1 or len(weight_values) > 1 or len(height_values) > 1:
+            profile_count = max(len(age_values), len(weight_values), len(height_values))
+
+            def expand(values, target_len):
+                if len(values) == target_len:
+                    return values
+                if len(values) == 1:
+                    return values * target_len
+                if len(values) < target_len:
+                    # Repeat the last provided value for shorter lists.
+                    return values + [values[-1]] * (target_len - len(values))
+                return values[:target_len]
+
+            ages = expand(age_values, profile_count)
+            weights = expand(weight_values, profile_count)
+            heights = expand(height_values, profile_count)
+
+            picks = []
+            for a, w, h in zip(ages, weights, heights):
+                picks.append(select_single_best(df_out, a, w, h))
+            return pd.concat(picks, ignore_index=True)
+
+        age_mn, age_mx = bounds(age_values)
+        weight_mn, weight_mx = bounds(weight_values)
+        height_mn, height_mx = bounds(height_values)
+        is_batch = (age_mn != age_mx or weight_mn != weight_mx or height_mn != height_mx)
         
         if is_batch:
             mask = pd.Series(True, index=df_out.index)
             # Age
-            mn, mx = filters_in['age_range']
+            mn, mx = age_mn, age_mx
             if mn != -1: mask &= (df_out['Min Age (year)'] <= mx) & (df_out['Max Age (year)'] >= mn)
             # Weight
-            mn, mx = filters_in['weight_range']
+            mn, mx = weight_mn, weight_mx
             if mn != -1: mask &= (df_out['weight (kg)'] >= mn) & (df_out['weight (kg)'] <= mx)
             # Height
-            mn, mx = filters_in['height_range']
+            mn, mx = height_mn, height_mx
             if mn != -1: mask &= (df_out['height (m)'] >= mn) & (df_out['height (m)'] <= mx)
             return df_out[mask]
         
         else:
             # Single Best Match Logic (Distance Metric)
-            target_a, target_w, target_h = filters_in['age_range'][0], filters_in['weight_range'][0], filters_in['height_range'][0]
-            scores = np.zeros(len(df_out))
-            
-            if target_a != -1:
-                mid = (df_out['Min Age (year)'].values + df_out['Max Age (year)'].values) / 2
-                scores += np.abs(mid - target_a) / 10.0
-            if target_w != -1: scores += np.abs(df_out['weight (kg)'].values - target_w) / 10.0
-            if target_h != -1: scores += np.abs(df_out['height (m)'].values - target_h) / 0.10
-            
-            best_idx = scores.argmin()
-            return df_out.iloc[[best_idx]]
+            target_a, target_w, target_h = age_mn, weight_mn, height_mn
+            return select_single_best(df_out, target_a, target_w, target_h)
 
     # --- REFLECTION LOOP ---
     max_retries = 3
@@ -398,11 +709,20 @@ def model_selection_node(state):
 
     # Load API Keys once
     try:
-        with open('info_and_keys.json') as f: keys = json.load(f)
-        if MODEL == 'openai': client = OpenAI(api_key=keys['openai_api_key'])
-        elif MODEL == 'gemini': genai.configure(api_key=keys['gemini_api_key'])
-    except:
-        return {"final_message": "Error: API Keys missing."}
+        with open('info_and_keys.json') as f:
+            keys = json.load(f)
+
+        if MODEL == 'openai':
+            openai_key = keys.get('openai_api_key', '')
+            if not openai_key or openai_key.strip() == '???':
+                return {"final_message": "Error: Missing openai_api_key in info_and_keys.json."}
+            client = OpenAI(api_key=openai_key)
+        elif MODEL == 'gemini':
+            gemini_key = keys.get('gemini_api_key', '')
+            if not gemini_key or gemini_key.strip() == '???':
+                return {"final_message": "Error: Missing gemini_api_key in info_and_keys.json."}
+    except Exception as e:
+        return {"final_message": f"Error loading API keys: {e}"}
 
     for attempt in range(1, max_retries + 1):
         print(f"-> Attempt {attempt}: Filtering...")
@@ -470,9 +790,8 @@ def model_selection_node(state):
                     )
                     content = response.choices[0].message.content
                 elif MODEL == 'gemini':
-                    model = genai.GenerativeModel("gemini-2.0-flash-exp")
-                    response = model.generate_content(prompt)
-                    content = response.text.replace('```json', '').replace('```', '').strip()
+                    content = _gemini_generate_text(keys['gemini_api_key'], MODEL_TYPE, prompt)
+                    content = content.replace('```json', '').replace('```', '').strip()
                 
                 # Apply new filters
                 new_filters = json.loads(content)
@@ -494,7 +813,7 @@ def model_selection_node(state):
         clean_path = f"{str(raw_dir).replace('\\', '/').lstrip('./')}/{row['Filename']}"
         results.append({**row.to_dict(), "full_path": clean_path})
 
-    msg = f"Model Selection Complete. Found {len(results)} model(s)."
+    msg = f"Model Selection Complete. Found {len(results)} model(s). \n The simulation is result {results}"
     return {"selected_models": results, "current_status": msg}
 
 
@@ -605,7 +924,22 @@ def data_processing_node(state):
     print("--- Node 4: Processing Results to DataFrames ---")
     
     sim_outputs = state.get('simulation_output', [])
+    if not isinstance(sim_outputs, list):
+        sim_outputs = []
     models = state.get('selected_models', [])
+
+    # ===== TEMP DEBUG START: save a local copy of raw simulation output =====
+    # This is intentionally temporary so sim_outputs can be reviewed offline.
+    try:
+        debug_dir = os.path.join(os.getcwd(), 'debug_outputs')
+        os.makedirs(debug_dir, exist_ok=True)
+        debug_path = os.path.join(debug_dir, 'latest_sim_outputs.json')
+        with open(debug_path, 'w', encoding='utf-8') as f:
+            json.dump(sim_outputs, f, indent=2, default=str)
+        print(f"[TEMP DEBUG] sim_outputs saved to: {debug_path}")
+    except Exception as e:
+        print(f"[TEMP DEBUG] Failed to save sim_outputs: {e}")
+    # ===== TEMP DEBUG END =====
     
     # 1. Create a lookup for model demographics
     model_map = {
@@ -619,6 +953,7 @@ def data_processing_node(state):
 
     # 2. Lists to hold rows
     spinal_data, force_data, activation_data = [], [], []
+    tidy_spinal_frames = []
 
     # 3. Helper to process dictionary to list of rows
     def extract_rows(base_info, data_dict, category_col, target_list):
@@ -649,10 +984,29 @@ def data_processing_node(state):
         extract_rows(base_row, results.get('muscle_forces'), 'Muscle_Name', force_data)
         extract_rows(base_row, results.get('muscle_activations'), 'Muscle_Name', activation_data)
 
+        # Build a tidy spinal table per run when raw spinal loads are available.
+        spinal_loads = results.get('spinal_loads')
+        if isinstance(spinal_loads, dict) and spinal_loads:
+            tidy_df = tidy_spinal_loads_tool(spinal_loads)
+            tidy_df.insert(0, 'Model', model_name)
+            tidy_df.insert(1, 'Activity', run['activity'])
+            tidy_df.insert(2, 'Age', demos.get('age'))
+            tidy_df.insert(3, 'Weight_kg', demos.get('weight'))
+            tidy_df.insert(4, 'Height_m', demos.get('height'))
+            tidy_spinal_frames.append(tidy_df)
+
+    if tidy_spinal_frames:
+        tidy_spinal = pd.concat(tidy_spinal_frames, ignore_index=True)
+    elif spinal_data:
+        tidy_spinal = pd.DataFrame(spinal_data)
+    else:
+        tidy_spinal = pd.DataFrame()
+
     # 5. Return DataFrames in state
     return {
         "dataframes": {
-            "spinal": pd.DataFrame(spinal_data),
+            #"spinal": pd.DataFrame(spinal_data),
+            "spinal": tidy_spinal,
             "forces": pd.DataFrame(force_data),
             "activations": pd.DataFrame(activation_data)
         },
@@ -660,503 +1014,238 @@ def data_processing_node(state):
     }
 
 
+# maybe a planner to plan out the analysis
 
-# def analysis_agent_node(state):
-#     """
-#     Node 5: The 'Analyst'. Connects to Chat logic using Pandas Dataframe Agents.
-#     Integrates the specific prompt logic provided in utils.
-#     """
-#     print("--- Node 5: Agentic Analysis (Chat) ---")
+
+def code_generation_node(state):
+    """
+    Node 5: The 'Coder'. Generates Python code to analyze the DataFrames.
+    """
+    print(f"--- Node 5: LLM is Writting Code According to Your Instructions ({MODEL}) for Iteration {state.get('iteratration_count', 0)+1}    ---")
     
-#     dfs = state.get('dataframes')
-#     if not dfs:
-#         return {"final_message": "Error: No data available for analysis."}
+    # 2. Context
+    previous_code = (state.get('code') or '').strip()
+    if previous_code:
+        print("[DEBUG] Previous generated code before retry:")
+        print(previous_code)
 
-#     # 1. Load Keys
-#     try:
-#         with open('info_and_keys.json') as f:
-#             keys = json.load(f)
-#     except:
-#         return {"final_message": "Error loading keys for analysis agent."}
+    chat_history = state.get('chat_context', "")
+    analysis_query = (state.get('analysis_request') or state.get('user_prompt') or '').strip()
+    if not analysis_query:
+        analysis_query = "Summarize key findings from spinal loads and highlight the largest compression value."
+    normalized_dfs = _ensure_dataframe_bundle(state.get('dataframes'))
+    spinal = normalized_dfs.get('spinal')
+    force = normalized_dfs.get('forces')
+    activation = normalized_dfs.get('activations')
 
-#     # 2. Init LLM
-#     if MODEL == 'openai':
-#         llm = ChatOpenAI(model=MODEL_TYPE, api_key=keys["openai_api_key"])
-#     else:
-#         llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp", google_api_key=keys["gemini_api_key"])
+    def _format_columns(df):
+        if isinstance(df, pd.DataFrame):
+            return ', '.join(map(str, df.columns.tolist())) or 'none'
+        return 'none'
 
-#     # 3. Define Domain Knowledge (Prefixes)
-#     domain_knowledge = """
-#     You are a Biomechanics Assistant analyzing OpenSim data.
+    def _format_sample(df, name):
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return f"{name}: EMPTY"
+        sample = df.head(5).to_string(index=False)
+        return f"{name} (first 5 rows):\n{sample}"
+
+    spinal_cols = _format_columns(spinal)
+    force_cols = _format_columns(force)
+    activation_cols = _format_columns(activation)
+    spinal_sample = _format_sample(spinal, "spinal")
+    force_sample = _format_sample(force, "forces")
+    activation_sample = _format_sample(activation, "activations")
+
+    system_prompt = f"""
+    You are an expert Bio-Mechanical Data Analyst specializing in spinal kinematics and muscle dynamics. 
+    Your goal is to provide executable Python code to analyze biomechanical datasets.
+
+    ### DATASET ARCHITECTURE:
+    - Data is available from `state.get('dataframes', {{}})` and normalized to pandas DataFrames before code generation.
+    - 'spinal': Contains spinal load data with columns {spinal_cols}.
+    - 'forces': Contains muscle force data with columns {force_cols}.
+    - 'activations': Contains muscle activation data with columns {activation_cols}.
+
+    ### DATA SAMPLES (use these to infer structure and types):
+    {spinal_sample}
+
+    {force_sample}
+
+    {activation_sample}
+
+    ### BIOMECHANICAL DOMAIN KNOWLEDGE:
+    - Spinal loads are in Newtons. For vertebral load vectors, fy is typically compression/distraction axis and fx/fz represent shear components.
+    - Larger absolute compression magnitudes indicate higher disc/joint loading demand.
+    - Muscle force values are in Newtons and reflect estimated tension production by each muscle element.
+    - Muscle activation values are unitless (approximately 0 to 1), where larger values indicate higher neural drive.
+    - If both force and activation are available, discuss them together: high activation with low force can indicate short moment arm or unfavorable mechanics.
+    - When comparing conditions, clearly report the condition labels (for example Model, Activity, joint_level, Muscle_Name) and numeric deltas.
+
+    "STRICT RULES:\n"
+    "1. Always use pandas for data loading.\n"
+    "2. If the task requires a visual, use matplotlib/seaborn and SAVE it as 'static/generated_plot.png'.\n"
+    "3. NEVER use plt.show(). Use plt.savefig('static/generated_plot.png') instead.\n"
+    "4. Always print() your findings in plain language.\n"
+    "5. Your final print line MUST start with 'SUMMARY:' and include key numeric findings.\n"
+    "6. Respond ONLY with raw code (no markdown blocks)."
+    """
+
+    if chat_history:
+        system_prompt += f"\n\n### RECENT CHAT CONTEXT:\n{chat_history}"
+
+    system_prompt += f"\n\n### USER QUESTION:\n{analysis_query}"
     
-#     DATA DEFINITIONS:
-#     1. SPINAL LOADS:
-#        - *_fy = Compression forces (Vertical).
-#        - *_fx, *_fz = Shear forces (Horizontal).
-#        - T1_T2...L5_S1 = Spinal joints.
-    
-#     2. MUSCLE FORCES (Newtons) & ACTIVATIONS (0.0-1.0):
-#        - Suffixes: '_r'/'_R' = Right, '_l'/'_L' = Left.
-#        - No suffix usually implies Right/Primary.
-#        - Groups: 
-#          * Psoas ('Ps_...')
-#          * Iliocostalis ('IL_...')
-#          * Longissimus ('LTpT_...', 'LTpL_...')
-#          * Quadratus Lumborum ('QL_...')
-#          * Multifidus ('MF_...')
-#          * Abdominals ('rect_abd', 'IO', 'EO')
-#     """
-
-#     # 4. Create Agent 
-#     # We allow the agent to see all 3 DataFrames to cross-reference if needed
-#     agent = create_pandas_dataframe_agent(
-#         llm=llm,
-#         df=[dfs['spinal'], dfs['forces'], dfs['activations']],
-#         verbose=True,
-#         allow_dangerous_code=True, # Required for Pandas Agent
-#         agent_type="openai-tools",
-#         handle_parsing_errors=True,
-#         prefix=domain_knowledge
-#     )
-
-#     # 5. Construct Query
-#     # We combine the User's original intent + a request for summary
-
-#     plot_instructions = """
-#     Only if asked for plotting; otherwise, ignore: RULES FOR PLOTTING (MUST FOLLOW STICTLY):
-#     1. SETUP:
-#        - You MUST use `plt.switch_backend('Agg')` at the start of your code to prevent GUI errors.
-#        - Use `plt.figure(figsize=(10, 6))` for legibility.
-#        - Use `plt.style.use('ggplot')` for professional formatting.
-       
-#     2. DATA SELECTION:
-#        - Always verify the exact column name exists in `df.columns` before plotting. Use fuzzy matching if needed (e.g., if user asks for "L5 compression", look for "L5_S1_fy").
-#        - The X-Axis must ALWAYS be the 'time' column.
-    
-#     3. RENDERING:
-#        - clear the figure with `plt.clf()` before plotting.
-#        - Add a title, X-label ('Time [s]'), and Y-label (with units like 'Newtons' or 'Activation').
-#        - If plotting multiple muscles, include a legend.
-       
-#     4. SAVING:
-#        - You MUST save the file to: 'static/generated_plot.png' (Create the directory if it doesn't exist).
-#        - Use `plt.savefig('static/generated_plot.png', dpi=300, bbox_inches='tight')`.
-#        - DO NOT use `plt.show()`.
-    
-#     5. OUTPUT:
-#        - After saving, your final answer MUST confirm: "Plot saved to static/generated_plot.png".
-#        - Provide a brief 1-sentence interpretation of the peak values in the plot.
-#     """
-
-#     query = (
-#         f"The user asked: '{state['user_prompt']}'.\n"
-#         "1. Analyze the provided DataFrames (df1=Spinal, df2=Forces, df3=Activations).\n"
-#         "2. If the user asks for a PLOT or GRAPH:\n"
-#         f"{plot_instructions}\n"
-#         "3. Provide a text summary of what the plot shows."
-#     )
-
-#     try:
-#         response = agent.invoke({"input": query})
-#         output_text = response["output"] if isinstance(response, dict) else str(response)
-#         return {"final_message": output_text}
-#     except Exception as e:
-#         return {"final_message": f"Analysis Agent Error: {e}"}
-
-
-
-
-# def analysis_agent_node(state):
-#     """
-#     Node 5: The 'Analyst'. 
-#     Architecture:
-#     1. PLANNER LLM: Reads history -> Decides which of the 3 DataFrames to use.
-#     2. ROUTER: Activates ONLY the specific agent for that DataFrame.
-#     3. SPECIALIST AGENT: executes the query with strict domain knowledge.
-#     """
-#     print(f"--- Node 5: Agentic Analysis ({MODEL}) ---")
-    
-#     dfs = state.get('dataframes')
-#     if not dfs:
-#         return {"final_message": "Error: No data available for analysis."}
-    
-#     # 1. Load Keys & Init LLM (STRICTLY USING YOUR GLOBALS)
-#     try:
-#         with open('info_and_keys.json') as f: 
-#             keys = json.load(f)
+        # 1. Load Keys & Init LLM
+    try:
+        with open('info_and_keys.json') as f: 
+            keys = json.load(f)
         
-#         if MODEL == 'openai':
-#             llm = ChatOpenAI(
-#                 model=MODEL_TYPE, 
-#                 api_key=keys["openai_api_key"], 
-#                 temperature=0
-#             )
-#         elif MODEL == 'gemini':
-#             llm = ChatGoogleGenerativeAI(
-#                 model=MODEL_TYPE, 
-#                 google_api_key=keys["gemini_api_key"], 
-#                 temperature=0
-#             )
-#         else:
-#             return {"final_message": f"Error: Unknown MODEL configuration '{MODEL}'"}
+        if MODEL == 'openai':
+            llm = ChatOpenAI(
+                model=MODEL_TYPE, 
+                api_key=keys["openai_api_key"], 
+                temperature=0
+            )
+        elif MODEL == 'gemini':
+            llm = ChatGoogleGenerativeAI(
+                model=MODEL_TYPE, 
+                google_api_key=keys["gemini_api_key"], 
+                temperature=0
+            )
+        else:
+            return {"final_message": f"Error: Unknown MODEL configuration '{MODEL}'"}
             
-#     except Exception as e:
-#         return {"final_message": f"Config/LLM Init Error: {e}"}
-
-#     # 2. Prepare Context
-#     chat_history = state.get('chat_context', "No prior history.")
-#     user_input = state.get('user_prompt', "")
-
-#     # ==================================================================================
-#     # STEP 1: THE PLANNER (Decide Intent & DataFrame)
-#     # ==================================================================================
-#     planner_prompt = f"""
-#     You are the "Planner". 
+    except Exception as e:
+        return {"final_message": f"Config/LLM Init Error: {e}"}
     
-#     CONTEXT:
-#     User Input: "{user_input}"
-#     Chat History: 
-#     {chat_history}
+
+    response = llm.invoke(system_prompt)
+    response_text = getattr(response, "text", None) or getattr(response, "content", "")
+    if isinstance(response_text, list):
+        response_text = "\n".join(map(str, response_text))
+    clean_code = str(response_text).replace("```python", "").replace("```", "").strip()
+
+    if not clean_code:
+        return {"final_message": "Code generation returned empty output."}
+
+    prior_history = state.get("code_history") or []
+    updated_history = prior_history + [clean_code]
+    return {
+        "code": clean_code,
+        "code_history": updated_history,
+        "dataframes": normalized_dfs,
+        "iteratration_count": state.get("iteratration_count", 0) + 1,
+    }
+
+def repl_execution_node(state):
+    """
+    Node 6: The 'Executor'. Executes generated code in a safe REPL environment.
+    """
+    print(f"--- Node 6: REPL Execution Placeholder ({MODEL}) for Iteration {state.get('iteratration_count', 0)} ---")
     
-#     AVAILABLE AGENTS / DATAFRAMES:
-#     1. 'spinal': For spinal joint loads (Compression/Shear).
-#        - Columns: ['Model', 'Activity', 'Load_Name', 'Value']
-#     2. 'forces': For specific muscle forces (Newtons).
-#        - Columns: ['Model', 'Activity', 'Muscle_Name', 'Value']
-#     3. 'activations': For muscle activation levels (0.0 to 1.0).
-#        - Columns: ['Model', 'Activity', 'Muscle_Name', 'Value']
+    # For now, we just return a message. The actual implementation would involve:
+    # 1. Taking generated code from state['generated_code']
+    # 2. Executing it in a Python REPL environment with access to state['dataframes']
+    # 3. Capturing output and returning it to the user.
+    # Pre-run cleanup
+    if os.path.exists("output_chart.png"):
+        os.remove("output_chart.png")
+    if os.path.exists("static/generated_plot.png"):
+        os.remove("static/generated_plot.png")
+
+    try:
+        code_to_run = state.get("code", "")
+        if not code_to_run:
+            return {"error_message": "No generated code found in state.", "final_message": "No generated code found in state."}
+
+        dfs = _ensure_dataframe_bundle(state.get("dataframes"))
+        exec_globals = {"pd": pd, "np": np, "plt": plt}
+        safe_state = {
+            "dataframes": dfs,
+            "analysis_request": state.get("analysis_request", ""),
+            "user_prompt": state.get("user_prompt", ""),
+        }
+        exec_locals = {
+            "state": safe_state,
+            "dfs": dfs,
+            "spinal": dfs.get("spinal"),
+            "forces": dfs.get("forces"),
+            "activations": dfs.get("activations"),
+            "df_spinal": dfs.get("spinal"),
+            "df_forces": dfs.get("forces"),
+            "df_activations": dfs.get("activations"),
+        }
+
+        stdout_buffer = io.StringIO()
+        with contextlib.redirect_stdout(stdout_buffer):
+            exec(code_to_run, exec_globals, exec_locals)
+
+        logs = stdout_buffer.getvalue().strip()
+        has_image = "static/generated_plot.png" if os.path.exists("static/generated_plot.png") else (
+            "output_chart.png" if os.path.exists("output_chart.png") else None
+        )
+        final_text = logs or "Analysis completed successfully."
+
+        print("✅ Execution successful.")
+        return {
+            "error_message": "",
+            "text_result": final_text,
+            "image_path": has_image,
+            "raw_execution_logs": final_text,
+        }
+
+    except Exception:
+        err = traceback.format_exc()
+        print("❌ Code failed. Sending error back to LLM.")
+        return {"error_message": err, "raw_execution_logs": ""}
+
+
+def execution_output_node(state):
+    """
+    Node 7: Convert raw execution artifacts into user-facing language and image outputs.
+    """
+    print(f"--- Node 7: Execution Output Processor ({MODEL}) ---")
+
+    error_msg = (state.get("error_message") or "").strip()
+    if error_msg:
+        return {
+            "language_output": "",
+            "image_output": None,
+            "final_message": error_msg,
+            "current_status": "Execution failed. Retrying with updated code.",
+        }
+
+    text_result = (state.get("text_result") or state.get("raw_execution_logs") or "").strip()
+    image_output = state.get("image_path")
+
+    if not text_result and image_output:
+        text_result = "Plot generated successfully."
+    elif not text_result:
+        text_result = "Analysis completed successfully."
+
+    return {
+        "language_output": text_result,
+        "image_output": image_output,
+        "final_message": text_result,
+        "current_status": "Analysis response ready.",
+    }
+
+
+def router_node(state):
+    """
+    Node 7: The 'Router'. Decides whether to send the user back to the Coder or REPL based on their needs.
+    This is a placeholder for where you would implement logic to route the user appropriately.
+    """
+    print(f"--- Node 7: Router Placeholder ({MODEL}) ---")
     
-#     YOUR TASK:
-#     1. Analyze what the user is asking for.
-#     2. Select ONE agent ('spinal', 'forces', or 'activations').
-#     3. Write a specific instruction for that agent.
-    
-#     RULES:
-#     - If the user asks for "L5 compression" or "Shear", choose 'spinal'.
-#     - If the user asks for "Longissimus" or "Psoas" force, choose 'forces'.
-#     - If the user asks for "Effort" or "Activation", choose 'activations'.
-#     - If vague, default to 'spinal' with a summary request.
-    
-#     OUTPUT JSON ONLY:
-#     {{
-#         "target_agent": "spinal" | "forces" | "activations",
-#         "instruction": "Precise instruction for the coding agent..."
-#     }}
-#     """
-    
-#     try:
-#         response = llm.invoke(planner_prompt)
-#         # Clean markdown
-#         content = response.content.replace('```json', '').replace('```', '').strip()
-#         plan = json.loads(content)
-        
-#         target = plan.get('target_agent', 'spinal')
-#         instruction = plan.get('instruction', 'Summarize the data.')
-        
-#         print(f"[Planner] Decided: {target.upper()}")
-#         print(f"[Planner] Task: {instruction}")
-        
-#     except Exception as e:
-#         print(f"Planner Error: {e}")
-#         target = "spinal"
-#         instruction = "Summarize the spinal load data."
+    # For now, we just return a message. The actual implementation would involve:
+    # 1. Analyzing user needs from state['user_prompt'] or other context
+    # 2. Deciding whether they need more code generation (send back to Coder) or execution (send to REPL)
+    # 3. Returning routing information in the state for the UI to handle.
 
-#     # ==================================================================================
-#     # STEP 2 & 3: DEFINE AND SELECT THE SPECIFIC AGENT
-#     # ==================================================================================
-    
-#     # Common Plotting Rules for all agents
-#     plot_rules = """
-#     IF PLOTTING:
-#     - You MUST use `plt.switch_backend('Agg')` first.
-#     - `plt.clf()` to clear.
-#     - Save to 'static/generated_plot.png'.
-#     - DO NOT use `plt.show()`.
-#     """
-
-#     selected_df = None
-#     agent_prefix = ""
-
-#     # --- AGENT A: SPINAL AGENT ---
-#     if target == 'spinal':
-#         selected_df = dfs['spinal']
-#         agent_prefix = f"""
-#         You are the SPINAL LOAD SPECIALIST.
-        
-#         YOUR DATA (`df`):
-#         - Format: Long format (Rows are individual measurements).
-#         - Columns: ['Model', 'Activity', 'Age', 'Weight_kg', 'Height_m', 'Load_Name', 'Value']
-        
-#         DOMAIN KNOWLEDGE:
-#         - `Load_Name` contains the joint and direction.
-#         - `_fy` suffix = Compression Forces (Vertical).
-#         - `_fx` or `_fz` suffix = Shear Forces (Horizontal).
-#         - `Value` is in Newtons.
-        
-#         TASK: {instruction}
-        
-#         TIPS:
-#         - To find L5 Compression: Filter `df` where `Load_Name` contains 'L5' and 'fy'.
-#         - {plot_rules}
-#         """
-
-#     # --- AGENT B: MUSCLE FORCES AGENT ---
-#     elif target == 'forces':
-#         selected_df = dfs['forces']
-#         agent_prefix = f"""
-#         You are the MUSCLE FORCE SPECIALIST.
-        
-#         YOUR DATA (`df`):
-#         - Format: Long format.
-#         - Columns: ['Model', 'Activity', 'Age', 'Weight_kg', 'Height_m', 'Muscle_Name', 'Value']
-#         - `Value` is Force in Newtons.
-        
-#         MUSCLE NAMING CONVENTION (in `Muscle_Name`):
-#         - Suffixes: '_l' or '_L' (Left), '_r' or '_R' (Right).
-#         - No suffix usually implies Right.
-#         - Groups (Prefixes):
-#           * 'Ps_' = Psoas
-#           * 'IL_' = Iliocostalis
-#           * 'LTpT_', 'LTpL_' = Longissimus (Thoracic/Lumbar)
-#           * 'QL_' = Quadratus Lumborum
-#           * 'MF_' = Multifidus
-#           * 'rect_abd', 'IO', 'EO' = Abdominals
-        
-#         TASK: {instruction}
-        
-#         TIPS:
-#         - Use string contains to filter groups (e.g. `df[df['Muscle_Name'].str.contains('LTp')]`).
-#         - {plot_rules}
-#         """
-
-#     # --- AGENT C: ACTIVATIONS AGENT ---
-#     elif target == 'activations':
-#         selected_df = dfs['activations']
-#         agent_prefix = f"""
-#         You are the MUSCLE ACTIVATION SPECIALIST.
-        
-#         YOUR DATA (`df`):
-#         - Format: Long format.
-#         - Columns: ['Model', 'Activity', 'Age', 'Weight_kg', 'Height_m', 'Muscle_Name', 'Value']
-#         - `Value` is Activation (0.0 to 1.0). 1.0 = Max effort.
-        
-#         MUSCLE NAMING CONVENTION:
-#         - Suffixes: '_l' (Left), '_r' (Right).
-#         - Groups: 'Ps_' (Psoas), 'IL_' (Iliocostalis), 'LTpT_'/'LTpL_' (Longissimus), 'QL_' (Quad Lumb), 'MF_' (Multifidus).
-        
-#         TASK: {instruction}
-        
-#         TIPS:
-#         - {plot_rules}
-#         """
-
-#     # Sanity Check
-#     if selected_df is None or selected_df.empty:
-#         return {"final_message": f"Error: The chosen dataframe ({target}) is empty or missing."}
-
-#     # ==================================================================================
-#     # STEP 4: EXECUTE THE CHOSEN AGENT
-#     # ==================================================================================
-#     try:
-#         agent = create_pandas_dataframe_agent(
-#             llm=llm,
-#             df=selected_df,
-#             verbose=True,
-#             allow_dangerous_code=True,
-#             agent_type="openai-tools",
-#             handle_parsing_errors=True,
-#             prefix=agent_prefix
-#         )
-
-#         response = agent.invoke({"input": instruction})
-#         output_text = response["output"] if isinstance(response, dict) else str(response)
-        
-#         # Check for plot file creation hint
-#         if "plot" in instruction.lower() and "saved" not in output_text.lower():
-#              output_text += "\n(Note: Check the dashboard for the generated plot.)"
-             
-#         return {"final_message": output_text}
-        
-#     except Exception as e:
-#         return {"final_message": f"Analysis Error in {target.upper()} agent: {e}"}
-
-
-
-# def analysis_agent_node(state):
-#     """
-#     Node 5: The 'Analyst'. 
-#     - USES: 3-Agent Architecture (Planner -> Specialist).
-#     - FIXES: "I don't have dataframe" errors (via strict system prompts).
-#     - RESTORED: Full Domain Knowledge for mapping 'Psoas' -> 'Ps_', etc.
-#     """
-#     print(f"--- Node 5: Agentic Analysis ({MODEL}) ---")
-    
-#     dfs = state.get('dataframes')
-#     if not dfs:
-#         return {"final_message": "Error: No data available for analysis."}
-    
-#     # 1. Load Keys & Init LLM
-#     try:
-#         with open('info_and_keys.json') as f: 
-#             keys = json.load(f)
-        
-#         if MODEL == 'openai':
-#             llm = ChatOpenAI(
-#                 model=MODEL_TYPE, 
-#                 api_key=keys["openai_api_key"], 
-#                 temperature=0
-#             )
-#         elif MODEL == 'gemini':
-#             llm = ChatGoogleGenerativeAI(
-#                 model=MODEL_TYPE, 
-#                 google_api_key=keys["gemini_api_key"], 
-#                 temperature=0
-#             )
-#         else:
-#             return {"final_message": f"Error: Unknown MODEL configuration '{MODEL}'"}
-            
-#     except Exception as e:
-#         return {"final_message": f"Config/LLM Init Error: {e}"}
-
-#     # 2. Context
-#     chat_history = state.get('chat_context', "No prior history.")
-#     user_input = state.get('user_prompt', "")
-
-#     # ==================================================================================
-#     # STEP 1: THE PLANNER
-#     # ==================================================================================
-#     planner_prompt = f"""
-#     You are the "Planner".
-    
-#     USER INPUT: "{user_input}"
-#     CHAT HISTORY: 
-#     {chat_history}
-    
-#     AVAILABLE DATAFRAMES:
-#     1. 'spinal' (Columns: Model, Activity, Load_Name, Value)
-#     2. 'forces' (Columns: Model, Activity, Muscle_Name, Value)
-#     3. 'activations' (Columns: Model, Activity, Muscle_Name, Value)
-    
-#     TASK:
-#     1. Select ONE dataframe ('spinal', 'forces', or 'activations').
-#     2. Write a Python-focused instruction.
-    
-#     RULES:
-#     - If user asks for "L5 compression" or "Shear", use 'spinal'.
-#     - If user asks for "Muscle Force" (Newtons), use 'forces'.
-#     - If user asks for "Activation", "Effort" or "Recruitment" (0-1), use 'activations'.
-#     - If plotting is needed, explicitly say: "Plot the data and save to static/generated_plot.png".
-    
-#     OUTPUT JSON ONLY:
-#     {{
-#         "target_agent": "spinal" | "forces" | "activations",
-#         "instruction": "Exact instruction for the agent..."
-#     }}
-#     """
-    
-#     try:
-#         response = llm.invoke(planner_prompt)
-#         content = response.content.replace('```json', '').replace('```', '').strip()
-#         plan = json.loads(content)
-#         target = plan.get('target_agent', 'spinal')
-#         instruction = plan.get('instruction', 'Summarize data.')
-#         print(f"[Planner] Target: {target} | Instruction: {instruction}")
-        
-#     except Exception as e:
-#         print(f"Planner Error: {e}")
-#         target = "spinal"
-#         instruction = "Summarize the spinal load data."
-
-#     # ==================================================================================
-#     # STEP 2: CONFIGURE THE SPECIALIST AGENT (With Full Domain Knowledge)
-#     # ==================================================================================
-    
-#     selected_df = dfs.get(target)
-#     if selected_df is None or selected_df.empty:
-#         return {"final_message": f"Error: Dataframe '{target}' is empty."}
-
-#     # --- COMMON GUARDRAILS (The Fix for "I don't have data") ---
-#     base_prefix = f"""
-#     You are a Python Data Analyst. 
-    
-#     CRITICAL EXECUTION RULES:
-#     1. The dataframe is ALREADY LOADED in your environment as the variable `df`.
-#     2. DO NOT ask the user for data. DO NOT say "I don't have access". USE `df` DIRECTLY.
-#     3. You MUST execute Python code to answer. Do not just write the code; RUN IT.
-    
-#     PLOTTING RULES (IF ASKED):
-#     - Use `plt.switch_backend('Agg')` at the start.
-#     - `plt.clf()` to clear previous plots.
-#     - Save strictly to: 'static/generated_plot.png'
-#     - DO NOT use `plt.show()`.
-#     """
-
-#     # --- RESTORED DOMAIN KNOWLEDGE ---
-#     if target == 'spinal':
-#         system_prefix = base_prefix + """
-        
-#         DOMAIN KNOWLEDGE (SPINAL LOADS):
-#         - `Load_Name` format: [Joint]_[Direction]
-#         - COMPRESSION (Vertical): Look for suffix `_fy`. (e.g., 'L5_S1_fy')
-#         - SHEAR (Horizontal): Look for suffixes `_fx` or `_fz`.
-#         - JOINTS: 'T1_T2', ... 'L5_S1'.
-#         - UNITS: Newtons.
-        
-#         TIP: To find 'L5 Compression', filter where `Load_Name` contains 'L5' AND ends with '_fy'.
-#         """
-        
-#     elif target in ['forces', 'activations']:
-#         system_prefix = base_prefix + f"""
-        
-#         DOMAIN KNOWLEDGE (MUSCLES):
-#         - COLUMN: 'Muscle_Name'
-#         - SUFFIXES: `_r` or `_R` (Right Side), `_l` or `_L` (Left Side).
-#           (If no suffix is specified by user, assume Both or Right).
-        
-#         MUSCLE MAPPING (Prefix -> Muscle Group):
-#         * 'Ps_'    -> Psoas Major
-#         * 'IL_'    -> Iliocostalis (e.g., IL_L1_L2_r)
-#         * 'LTpT_'  -> Longissimus Thoracis
-#         * 'LTpL_'  -> Longissimus Lumborum
-#         * 'QL_'    -> Quadratus Lumborum
-#         * 'MF_'    -> Multifidus
-#         * 'rect_abd' -> Rectus Abdominis
-#         * 'IO_'    -> Internal Oblique
-#         * 'EO_'    -> External Oblique
-        
-#         VALUE DEFINITION:
-#         - If 'forces' agent: Units are Newtons.
-#         - If 'activations' agent: Units are 0.0 to 1.0 (Normalized).
-#         """
-
-#     # ==================================================================================
-#     # STEP 3: EXECUTE
-#     # ==================================================================================
-#     try:
-#         agent = create_pandas_dataframe_agent(
-#             llm=llm,
-#             df=selected_df,
-#             verbose=True,
-#             allow_dangerous_code=True,
-#             agent_type="openai-tools",  
-#             handle_parsing_errors=True,
-#             prefix=system_prefix
-#         )
-
-#         # Force the input to remind the agent AGAIN that df exists
-#         final_prompt = f"{instruction} (Recall: Data is in variable `df`)"
-        
-#         response = agent.invoke({"input": final_prompt})
-#         output_text = response["output"] if isinstance(response, dict) else str(response)
-
-#         # Check for plot success in the text
-#         if "plot" in instruction.lower() and "saved" not in output_text.lower():
-#             output_text += "\n(System Note: A plot was requested. Check the dashboard.)"
-            
-#         return {"final_message": output_text}
-
-#     except Exception as e:
-#         return {"final_message": f"Agent Execution Error: {e}"}
+    if not state.get("error_message") or state.get("iteratration_count", 0) >= 3:
+        return "end"
+    return "retry"
 
 
 

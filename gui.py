@@ -5,16 +5,48 @@ import matplotlib.pyplot as plt
 import os  
 
 from main import app
-from utils import analysis_agent_node
+from utils import code_generation_node, repl_execution_node, execution_output_node, router_node, set_active_model, get_active_model
 
 st.set_page_config(page_title="Biomechanics AI Agent", layout="wide")
 
 st.title("🦴 Biomechanics Agent")
 
+if "active_model" not in st.session_state:
+    st.session_state.active_model = get_active_model()[0]
+
+try:
+    set_active_model(st.session_state.active_model)
+except Exception:
+    st.session_state.active_model = "gemini"
+    set_active_model("gemini")
+
 # --- SIDEBAR: Configuration ---
 with st.sidebar:
     st.header("Settings")
-    st.write("Current Model: GPT-4o-mini")
+
+    left_col, right_col = st.columns(2)
+    with left_col:
+        if st.button(
+            "Use Gemini",
+            use_container_width=True,
+            type="primary" if st.session_state.active_model == "gemini" else "secondary",
+        ):
+            st.session_state.active_model = "gemini"
+            set_active_model("gemini")
+            st.rerun()
+
+    with right_col:
+        if st.button(
+            "Use OpenAI",
+            use_container_width=True,
+            type="primary" if st.session_state.active_model == "openai" else "secondary",
+        ):
+            st.session_state.active_model = "openai"
+            set_active_model("openai")
+            st.rerun()
+
+    active_provider, active_model_type = get_active_model()
+    st.write(f"Current Model: {active_provider.upper()} ({active_model_type})")
     
     # File Uploader
     uploaded_file = st.file_uploader("Upload custom .mot or .osim file", type=['mot', 'osim'])
@@ -29,6 +61,64 @@ if "dataframes" not in st.session_state:
     st.session_state.dataframes = None
 if "simulation_done" not in st.session_state:
     st.session_state.simulation_done = False
+if "pending_followup" not in st.session_state:
+    st.session_state.pending_followup = None
+if "analysis_request" not in st.session_state:
+    st.session_state.analysis_request = ""
+
+
+def run_simulation_pipeline(payload):
+    """Run the LangGraph pipeline and return the aggregated final state."""
+    with st.status("Agent in work ...", expanded=True) as status:
+        # Clean up old plots before starting
+        if os.path.exists("static/generated_plot.png"):
+            try:
+                os.remove("static/generated_plot.png")
+            except Exception:
+                pass
+
+        final_state = {}
+        for step in app.stream(payload):
+            node_name = list(step.keys())[0]
+            node_output = step[node_name]
+
+            if "current_status" in node_output:
+                status.write(f"**{node_name.replace('_', ' ').title()}**: {node_output['current_status']}")
+
+            final_state.update(node_output)
+
+        status.update(label="Simulation Complete!", state="complete", expanded=False)
+        return final_state
+
+
+def run_followup_analysis(payload):
+    """Run iterative code-generation analysis on existing simulation data only."""
+    state = {
+        "user_prompt": payload.get("user_prompt", ""),
+        "analysis_request": payload.get("analysis_request", payload.get("user_prompt", "")),
+        "dataframes": payload.get("dataframes", {}),
+        "chat_context": payload.get("chat_context", ""),
+        # Reset these for every new question to avoid cross-question carryover.
+        "iteratration_count": 0,
+        "code_history": [],
+        "code": "",
+        "text_result": "",
+        "raw_execution_logs": "",
+        "image_path": None,
+        "language_output": "",
+        "image_output": None,
+        "error_message": "",
+    }
+
+    while True:
+        state.update(code_generation_node(state))
+        if state.get("final_message") and not state.get("code"):
+            return state
+
+        state.update(repl_execution_node(state))
+        state.update(execution_output_node(state))
+        if router_node(state) == "end":
+            return state
 
 
 # --- SECTION 1: SIMULATION ---
@@ -36,66 +126,111 @@ if not st.session_state.simulation_done:
     st.subheader("Enter prompt:")
     user_query = st.text_area("Describe the task:", 
         "Simulate standing upright for  72 kg man with height of between 170 cm. Analyze the compression forces on L5_S1. ")
+
+    if st.session_state.pending_followup:
+        st.warning("More input is needed before simulation can continue.")
+        st.markdown(st.session_state.pending_followup["question"])
+
+        with st.form("followup_form"):
+            followup_answer = st.text_area("Your clarification:")
+            followup_submitted = st.form_submit_button("Submit Clarification")
+
+        if followup_submitted:
+            if not followup_answer.strip():
+                st.error("Please enter a clarification answer.")
+            else:
+                try:
+                    payload = {
+                        "user_prompt": st.session_state.pending_followup["original_prompt"],
+                        "followup_answer": followup_answer.strip(),
+                        "partial_analysis": st.session_state.pending_followup.get("partial_analysis")
+                    }
+                    final_state = run_simulation_pipeline(payload)
+
+                    if final_state.get("dataframes"):
+                        st.session_state.pending_followup = None
+                        st.session_state.dataframes = final_state["dataframes"]
+                        st.session_state.analysis_request = final_state.get("analysis_request", "")
+                        st.session_state.simulation_done = True
+
+                        history_entry = {
+                            "role": "assistant",
+                            "content": final_state.get("final_message", "Done.")
+                        }
+
+                        if os.path.exists("static/generated_plot.png"):
+                            try:
+                                with open("static/generated_plot.png", "rb") as img_file:
+                                    history_entry["image"] = img_file.read()
+                            except Exception as e:
+                                st.error(f"Error loading initial plot: {e}")
+
+                        st.session_state.chat_history.append(history_entry)
+                        st.rerun()
+
+                    elif final_state.get("needs_user_input"):
+                        st.session_state.pending_followup = {
+                            "original_prompt": st.session_state.pending_followup["original_prompt"],
+                            "question": final_state.get("followup_question", final_state.get("final_message", "Please clarify your request.")),
+                            "partial_analysis": final_state.get("partial_analysis")
+                        }
+                        st.rerun()
+                    else:
+                        st.error(f"Simulation Failed: {final_state.get('final_message')}")
+
+                except Exception as e:
+                    st.error(f"Error: {e}")
     
     if st.button("Start Simulation"):
-        # Create a Status Container that updates in real-time
-        with st.status("Agent in work ...", expanded=True) as status:
-            try:
-                # 0. Clean up old plots before starting
+        try:
+            payload = {"user_prompt": user_query}
+            final_state = run_simulation_pipeline(payload)
+
+            if final_state.get("dataframes"):
+                st.session_state.pending_followup = None
+                st.session_state.dataframes = final_state["dataframes"]
+                st.session_state.analysis_request = final_state.get("analysis_request", "")
+                st.session_state.simulation_done = True
+
+                history_entry = {
+                    "role": "assistant",
+                    "content": final_state.get("final_message", "Done.")
+                }
+
                 if os.path.exists("static/generated_plot.png"):
-                    try: os.remove("static/generated_plot.png")
-                    except: pass
-                
-                final_state = {}
-                
-                # --- NEW STREAMING LOGIC ---
-                # app.stream yields steps as they finish (Node by Node)
-                for step in app.stream({"user_prompt": user_query}):
-                    
-                    # Get the name of the node that just finished (e.g., 'model_selector')
-                    node_name = list(step.keys())[0]
-                    node_output = step[node_name]
-                    
-                    # Check if there is a status message to display
-                    if "current_status" in node_output:
-                        status.write(f"**{node_name.replace('_', ' ').title()}**: {node_output['current_status']}")
-                    
-                    # Update our local state copy
-                    final_state.update(node_output)
+                    try:
+                        with open("static/generated_plot.png", "rb") as img_file:
+                            history_entry["image"] = img_file.read()
+                    except Exception as e:
+                        st.error(f"Error loading initial plot: {e}")
 
-                # --- END OF STREAM ---
-                status.update(label="Simulation Complete!", state="complete", expanded=False)
+                st.session_state.chat_history.append(history_entry)
+                st.rerun()
 
-                if final_state.get("dataframes"):
-                    st.session_state.dataframes = final_state["dataframes"]
-                    st.session_state.simulation_done = True
-                    
-                    history_entry = {
-                        "role": "assistant", 
-                        "content": final_state.get("final_message", "Done.")
-                    }
+            elif final_state.get("needs_user_input"):
+                st.session_state.pending_followup = {
+                    "original_prompt": user_query,
+                    "question": final_state.get("followup_question", final_state.get("final_message", "Please clarify your request.")),
+                    "partial_analysis": final_state.get("partial_analysis")
+                }
+                st.rerun()
+            else:
+                st.error(f"Simulation Failed: {final_state.get('final_message')}")
 
-                    # Check for plot immediately
-                    if os.path.exists("static/generated_plot.png"):
-                        try:
-                            with open("static/generated_plot.png", "rb") as img_file:
-                                history_entry["image"] = img_file.read()
-                        except Exception as e:
-                            st.error(f"Error loading initial plot: {e}")
-
-                    st.session_state.chat_history.append(history_entry)
-                    st.rerun()
-                else:
-                    st.error(f"Simulation Failed: {final_state.get('final_message')}")
-            
-            except Exception as e:
-                st.error(f"Error: {e}")
+        except Exception as e:
+            st.error(f"Error: {e}")
 
 
 
 # --- SECTION 2: ANALYSIS & PLOTTING ---
 else:
     st.subheader("2. Analysis Dashboard")
+
+    # Debug visibility for extracted analysis request from the original simulation prompt.
+    if st.session_state.analysis_request:
+        st.info(f"[DEBUG] Extracted analysis request: {st.session_state.analysis_request}")
+    else:
+        st.info("[DEBUG] Extracted analysis request: <empty>")
     
     # TABS
     tab1, tab2, tab3 = st.tabs(["💬 Chat Analysis", "📊 Data Explorer", "🔄 New Simulation"])
@@ -142,19 +277,23 @@ else:
 
                         state_payload = {
                             "user_prompt": prompt, 
+                            "analysis_request": prompt or st.session_state.analysis_request,
                             "dataframes": st.session_state.dataframes,
                             "chat_context": history_str 
                         }
+
+                        st.caption(f"[DEBUG] Active analysis request: {state_payload['analysis_request']}")
                         
-                        response = analysis_agent_node(state_payload)
+                        response = run_followup_analysis(state_payload)
                         answer = response["final_message"]
                         
                         st.markdown(answer)
                         
                         image_data = None
-                        if os.path.exists("static/generated_plot.png"):
+                        image_path = response.get("image_output")
+                        if image_path and os.path.exists(image_path):
                             try:
-                                with open("static/generated_plot.png", "rb") as img_file:
+                                with open(image_path, "rb") as img_file:
                                     image_data = img_file.read()
                                     st.image(image_data, caption="Agent Generated Plot")
                             except Exception as e:
