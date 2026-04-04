@@ -156,8 +156,8 @@ from langchain_experimental.agents import create_pandas_dataframe_agent
 
 MODEL = 'openai'
 # MODEL_TYPE = 'gpt-4o-mini'
-MODEL_TYPE = 'gpt-5-nano'
-# MODEL_TYPE = 'gpt-5.2'
+# MODEL_TYPE = 'gpt-5-nano'
+MODEL_TYPE = 'gpt-5.2'
 
 
 def run_opensim_simulation(
@@ -1263,8 +1263,8 @@ def analysis_agent_node(state):
             * 'QL_'    -> Quadratus Lumborum
             * 'MF_'    -> Multifidus
             * 'rect_abd' -> Rectus Abdominis
-            * 'IO_'    -> Internal Oblique
-#           * 'EO_'    -> External Oblique
+            * 'IO1', 'IO2', ...    -> Internal Oblique
+            * 'E0_R5', 'E0_R6', ...    -> External Oblique
     """
 
     # Global Rules for all agents (Anti-Hallucination & Conciseness)
