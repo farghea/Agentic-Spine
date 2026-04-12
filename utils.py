@@ -162,14 +162,32 @@ from Schemas_Pydantic.analyze_request_schemas import SubjectFilter, AnalysisResu
 # --- Data Formatting Tools ---
 from simulation_result_format.spinal_loads_data_formatter import tidy_spinal_loads_tool
 
+# --- LangSmith Setttings ---
+from langsmith import traceable, wrappers, Client
+from dotenv import load_dotenv
+load_dotenv()  # Load environment variables from .env file, if it exists
+
+
+def _langsmith_tracing_enabled():
+    value = os.getenv("LANGSMITH_TRACING_V2", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _create_gemini_client(api_key):
+    client = genai.Client(api_key=api_key)
+    if _langsmith_tracing_enabled():
+        return wrappers.wrap_gemini(client)
+    return client
+
 
 
 # --- Helper function to handle Gemini's response format ---
 
 
+@traceable(name="_gemini_generate_text", run_type="llm")
 def _gemini_generate_text(api_key, model_name, prompt):
     """Generate plain text from Gemini using the google.genai SDK."""
-    client = genai.Client(api_key=api_key)
+    client = _create_gemini_client(api_key)
     response = client.models.generate_content(model=model_name, contents=prompt)
     text = getattr(response, "text", None)
     if text:
@@ -219,6 +237,7 @@ def _split_simulation_and_analysis_request(user_prompt):
     return simulation_text, analysis_text
 
 
+@traceable(name="_llm_split_simulation_and_analysis_request", run_type="llm")
 def _llm_split_simulation_and_analysis_request(user_prompt, keys):
     """Use the active LLM to separate simulation intent from analysis intent."""
     raw = str(user_prompt or "").strip()
@@ -226,27 +245,27 @@ def _llm_split_simulation_and_analysis_request(user_prompt, keys):
         return "", ""
 
     split_prompt = f"""
-You split OpenSim requests into two parts.
+    You split OpenSim requests into two parts.
 
-User input:
-"{raw}"
+    User input:
+    "{raw}"
 
-Return JSON only with this schema:
-{{
-  "simulation_request": "text for subject/activity simulation setup only",
-  "analysis_request": "text for post-simulation analysis question, empty string if missing"
-}}
+    Return JSON only with this schema:
+    {{
+    "simulation_request": "text for subject/activity simulation setup only",
+    "analysis_request": "text for post-simulation analysis question, empty string if missing"
+    }}
 
-Rules:
-- Keep original wording when possible.
-- Put subject/activity/filter/model setup into simulation_request.
-- Put interpretation/comparison/summary/plot questions into analysis_request.
-- If user provides only simulation setup, set analysis_request to empty string.
-"""
+    Rules:
+    - Keep original wording when possible.
+    - Put subject/activity/filter/model setup into simulation_request.
+    - Put interpretation/comparison/summary/plot questions into analysis_request.
+    - If user provides only simulation setup, set analysis_request to empty string.
+    """
 
     try:
         if MODEL == 'openai':
-            client = OpenAI(api_key=keys['openai_api_key'])
+            client = wrappers.wrap_openai(OpenAI(api_key=keys['openai_api_key']))
             response = client.chat.completions.create(
                 model=MODEL_TYPE,
                 messages=[
@@ -258,7 +277,7 @@ Rules:
             )
             content = response.choices[0].message.content
         elif MODEL == 'gemini':
-            client = genai.Client(api_key=keys['gemini_api_key'])
+            client = _create_gemini_client(keys['gemini_api_key'])
             response = client.models.generate_content(
                 model=MODEL_TYPE,
                 contents=split_prompt,
@@ -314,6 +333,7 @@ def get_active_model():
     return MODEL, MODEL_TYPE
 
 
+@traceable(name="run_opensim_simulation", run_type="tool")
 def run_opensim_simulation(
         model_path, 
         motion_path, 
@@ -389,6 +409,7 @@ def run_opensim_simulation(
 
 
 
+@traceable(name="analyze_request_node", run_type="chain")
 def analyze_request_node(state):
     """
     Node 1: The 'Brain'. Extracts a LIST of activities and Subject Filters.
@@ -496,7 +517,7 @@ def analyze_request_node(state):
         content = ""
 
         if MODEL == 'openai':
-            client = OpenAI(api_key=keys['openai_api_key'])
+            client = wrappers.wrap_openai(OpenAI(api_key=keys['openai_api_key']))
             response = client.chat.completions.create(
                 model=MODEL_TYPE,
                 messages=[
@@ -508,7 +529,7 @@ def analyze_request_node(state):
             content = response.choices[0].message.content
 
         elif MODEL == 'gemini':
-            client = genai.Client(api_key=keys['gemini_api_key'])
+            client = _create_gemini_client(keys['gemini_api_key'])
             response = client.models.generate_content(
                 model=MODEL_TYPE,
                 contents=prompt,
@@ -576,6 +597,7 @@ def analyze_request_node(state):
 
 
 
+@traceable(name="model_selection_node", run_type="chain")
 def model_selection_node(state):
     """
     Node 2: The 'Selector'. 
@@ -716,7 +738,7 @@ def model_selection_node(state):
             openai_key = keys.get('openai_api_key', '')
             if not openai_key or openai_key.strip() == '???':
                 return {"final_message": "Error: Missing openai_api_key in info_and_keys.json."}
-            client = OpenAI(api_key=openai_key)
+            client = wrappers.wrap_openai(OpenAI(api_key=openai_key))
         elif MODEL == 'gemini':
             gemini_key = keys.get('gemini_api_key', '')
             if not gemini_key or gemini_key.strip() == '???':
@@ -819,6 +841,7 @@ def model_selection_node(state):
 
 
 
+@traceable(name="simulation_node", run_type="chain")
 def simulation_node(state):
     """
     Node 3: The 'Action'. Loops through selected Models and Activities 
@@ -917,6 +940,7 @@ def simulation_node(state):
 # = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = = =
 
 
+@traceable(name="data_processing_node", run_type="chain")
 def data_processing_node(state):
     """
     Node 4: Processes raw simulation results into structured DataFrames.
@@ -1017,6 +1041,7 @@ def data_processing_node(state):
 # maybe a planner to plan out the analysis
 
 
+@traceable(name="code_generation_node", run_type="chain")
 def code_generation_node(state):
     """
     Node 5: The 'Coder'. Generates Python code to analyze the DataFrames.
@@ -1137,6 +1162,7 @@ def code_generation_node(state):
         "iteratration_count": state.get("iteratration_count", 0) + 1,
     }
 
+@traceable(name="repl_execution_node", run_type="tool")
 def repl_execution_node(state):
     """
     Node 6: The 'Executor'. Executes generated code in a safe REPL environment.
@@ -1200,6 +1226,7 @@ def repl_execution_node(state):
         return {"error_message": err, "raw_execution_logs": ""}
 
 
+@traceable(name="execution_output_node", run_type="chain")
 def execution_output_node(state):
     """
     Node 7: Convert raw execution artifacts into user-facing language and image outputs.
@@ -1231,6 +1258,7 @@ def execution_output_node(state):
     }
 
 
+@traceable(name="router_node", run_type="chain")
 def router_node(state):
     """
     Node 7: The 'Router'. Decides whether to send the user back to the Coder or REPL based on their needs.
@@ -1249,6 +1277,7 @@ def router_node(state):
 
 
 
+@traceable(name="analysis_agent_node", run_type="chain")
 def analysis_agent_node(state):
     """
     Node 5: The 'Analyst'.

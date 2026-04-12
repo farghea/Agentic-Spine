@@ -3,6 +3,7 @@
 
 # Ignore specific sensitive credential file
 info_and_keys.json
+.env
 
 # Ignore local requirements file that may different from main settings
 requirements_agent_local.txt
@@ -16,5 +17,9 @@ potential_isses_might_need_addressing.txt
 
 # Python Bytecode
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
+
+# Local virtual environments
+.venv/

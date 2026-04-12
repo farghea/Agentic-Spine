@@ -1,4 +1,6 @@
 {
   "gemini_api_key": "???",
-  "openai_api_key": "???"
+  "openai_api_key": "???",
+  "langsmith_api_key": "???",
+  "langsmith_project": "Agentic_Spine"
 }
