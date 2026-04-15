@@ -469,7 +469,7 @@ def analyze_request_node(state):
     - Extract constraints for Sex, Age, Weight, Height.
     - Output numeric lists (sorted increasingly) for age_range, weight_range, height_range.
     - Lists can contain one or more values.
-    - For population comparison (e.g., ages 50, 60, 70), include all values in the relevant list.
+    - For population comparison (e.g., ages 50, 60, 70; weights 60, 70, 80 kg; heights 1.60, 1.70, 1.80 m), include all values in the relevant list.
     - Use -1 when a metric is unspecified.
 
     ### TASK 2: Activity Matching
