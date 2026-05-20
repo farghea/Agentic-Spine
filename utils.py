@@ -148,6 +148,7 @@ from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_experimental.agents import create_pandas_dataframe_agent
+from preprocessing.muscle_enrichment import filter_and_enrich
 
 # MODEL = 'gemini'
 # MODEL_TYPE = 'gemini-2.5-flash-lite'
@@ -157,7 +158,7 @@ from langchain_experimental.agents import create_pandas_dataframe_agent
 MODEL = 'openai'
 # MODEL_TYPE = 'gpt-4o-mini'
 # MODEL_TYPE = 'gpt-5-nano'
-MODEL_TYPE = 'gpt-5.2'
+MODEL_TYPE = 'gpt-5.4'
 
 
 def run_opensim_simulation(
@@ -321,27 +322,25 @@ def analyze_request_node(state):
 
 def model_selection_node(state):
     """
-    Node 2: The 'Selector'. 
-    1. Tries to find models using strict Python logic.
-    2. If 0 found, asks LLM to adjust criteria based on DB stats.
-    3. Retries up to 3 times.
+    Node 2: The 'Selector'.
+    Strategy:
+    - FAST PATH (KNN): If the user clearly describes a single specific person
+      (exact weight AND height, no range), skip the LLM and use KNN to find
+      the nearest 1 model deterministically.
+    - NORMAL PATH (3-pass LLM loop): Otherwise, run up to 3 LLM calls with
+      progressively widening tolerances until at least 1 model is found.
+    - FALLBACK: Python distance-score if all LLM passes fail.
     """
     print(f"--- Node 2: Selecting Model ({MODEL}) ---")
     
-    # 1. Setup Data & Config
     analysis = state.get('analysis_result')
     if not analysis or 'subject_filter' not in analysis:
         return {"final_message": "Error: Missing subject analysis."}
-    
-    # Deep copy filters to allow modification
-    current_filters = {
-        'sex': analysis['subject_filter']['sex'],
-        'age_range': list(analysis['subject_filter']['age_range']),
-        'weight_range': list(analysis['subject_filter']['weight_range']),
-        'height_range': list(analysis['subject_filter']['height_range'])
-    }
 
-    # Load Database
+    subject_filter = analysis['subject_filter']
+    user_prompt    = state.get('user_prompt', '')
+
+    # ── 1. Load DB ────────────────────────────────────────────────────────────
     try:
         csv_path = os.path.join(os.getcwd(), 'opensim_files', 'ms_model_details.csv')
         df = pd.read_csv(csv_path)
@@ -349,153 +348,449 @@ def model_selection_node(state):
     except Exception as e:
         return {"final_message": f"Error reading CSV: {e}"}
 
-    # --- HELPER: Pure Python Filtering Logic ---
-    def apply_filters(df_in, filters_in):
-        # 1. Sex Filter
-        if filters_in['sex'] != 'any':
-            df_out = df_in[df_in['sex'].str.lower() == filters_in['sex'].lower()]
-        else:
-            df_out = df_in.copy()
-            
-        if df_out.empty: return df_out
-
-        # 2. Check Mode
-        # If min != max for any metric, we treat it as a "Range/Batch" request
-        is_batch = (filters_in['age_range'][0] != filters_in['age_range'][1] or 
-                    filters_in['weight_range'][0] != filters_in['weight_range'][1] or 
-                    filters_in['height_range'][0] != filters_in['height_range'][1])
-        
-        if is_batch:
-            mask = pd.Series(True, index=df_out.index)
-            # Age
-            mn, mx = filters_in['age_range']
-            if mn != -1: mask &= (df_out['Min Age (year)'] <= mx) & (df_out['Max Age (year)'] >= mn)
-            # Weight
-            mn, mx = filters_in['weight_range']
-            if mn != -1: mask &= (df_out['weight (kg)'] >= mn) & (df_out['weight (kg)'] <= mx)
-            # Height
-            mn, mx = filters_in['height_range']
-            if mn != -1: mask &= (df_out['height (m)'] >= mn) & (df_out['height (m)'] <= mx)
-            return df_out[mask]
-        
-        else:
-            # Single Best Match Logic (Distance Metric)
-            target_a, target_w, target_h = filters_in['age_range'][0], filters_in['weight_range'][0], filters_in['height_range'][0]
-            scores = np.zeros(len(df_out))
-            
-            if target_a != -1:
-                mid = (df_out['Min Age (year)'].values + df_out['Max Age (year)'].values) / 2
-                scores += np.abs(mid - target_a) / 10.0
-            if target_w != -1: scores += np.abs(df_out['weight (kg)'].values - target_w) / 10.0
-            if target_h != -1: scores += np.abs(df_out['height (m)'].values - target_h) / 0.10
-            
-            best_idx = scores.argmin()
-            return df_out.iloc[[best_idx]]
-
-    # --- REFLECTION LOOP ---
-    max_retries = 3
-    selected_df = pd.DataFrame()
-
-    # Load API Keys once
+    # ── 2. Load API keys ──────────────────────────────────────────────────────
     try:
-        with open('info_and_keys.json') as f: keys = json.load(f)
-        if MODEL == 'openai': client = OpenAI(api_key=keys['openai_api_key'])
-        elif MODEL == 'gemini': genai.configure(api_key=keys['gemini_api_key'])
-    except:
-        return {"final_message": "Error: API Keys missing."}
+        with open('info_and_keys.json') as f:
+            keys = json.load(f)
+    except Exception as e:
+        return {"final_message": f"Error loading API keys: {e}"}
 
-    for attempt in range(1, max_retries + 1):
-        print(f"-> Attempt {attempt}: Filtering...")
-        
-        # A. Try Python Logic
-        selected_df = apply_filters(df, current_filters)
-        
-        if not selected_df.empty:
-            print(f"   -> Success: Found {len(selected_df)} models.")
-            break
-        
-        # B. IF FAILED: Ask LLM to adjust parameters
-        if attempt < max_retries:
-            print("   -> No models found. Asking LLM to adjust filters...")
-            
-            # Calculate DB Stats for Context (filtered by sex first)
-            sex_filter = current_filters['sex']
-            if sex_filter != 'any':
-                context_df = df[df['sex'].str.lower() == sex_filter.lower()]
+    # ── 3. Fill missing subject_filter values with DB averages ────────────────
+    # If the user didn't specify age/weight/height (-1), substitute the
+    # sex-appropriate average from the database so downstream logic always
+    # has a meaningful target value to work with.
+    sex_val = subject_filter.get('sex', 'any')
+    avg_pool = df[df['sex'].str.lower() == sex_val.lower()] if sex_val != 'any' else df
+    if avg_pool.empty:
+        avg_pool = df  # safety: use full DB if sex filter yields nothing
+
+    db_avg_age    = float((avg_pool['Min Age (year)'] + avg_pool['Max Age (year)']).mean() / 2) \
+                    if 'Min Age (year)' in avg_pool.columns else 50.0
+    db_avg_weight = float(avg_pool['weight (kg)'].mean()) \
+                    if 'weight (kg)' in avg_pool.columns else 75.0
+    db_avg_height = float(avg_pool['height (m)'].mean()) \
+                    if 'height (m)' in avg_pool.columns else 1.70
+
+    def _fill(rng, default):
+        """Replace -1 sentinels with default; return a [val, val] point if both -1."""
+        lo, hi = rng
+        lo = default if lo == -1 else lo
+        hi = default if hi == -1 else hi
+        return [lo, hi]
+
+    subject_filter = dict(subject_filter)  # make a mutable copy
+    subject_filter['age_range']    = _fill(subject_filter.get('age_range',    [-1, -1]), db_avg_age)
+    subject_filter['weight_range'] = _fill(subject_filter.get('weight_range', [-1, -1]), db_avg_weight)
+    subject_filter['height_range'] = _fill(subject_filter.get('height_range', [-1, -1]), db_avg_height)
+
+    print(f"   -> Effective subject_filter (after defaults): {subject_filter}")
+
+    # ── 4. Build compact DB summary for the LLM ───────────────────────────────
+    summary_cols = [c for c in ['Filename', 'sex', 'Min Age (year)', 'Max Age (year)',
+                                 'weight (kg)', 'height (m)', 'Directory']
+                    if c in df.columns]
+    # max_rows=None → show every row so the LLM can reference correct indices
+    db_summary = df[summary_cols].to_string(index=True, max_rows=None, max_colwidth=60)
+
+
+    # ── 3. Detect single-person request → KNN fast-path ──────────────────────
+    # A "single person" is indicated when BOTH weight AND height are given as
+    # an exact point (min == max and not -1), meaning no range was specified.
+    sf             = subject_filter
+    weight_range   = sf.get('weight_range', [-1, -1])
+    height_range   = sf.get('height_range', [-1, -1])
+    age_range      = sf.get('age_range',    [-1, -1])
+
+    is_single_person = (
+        weight_range[0] != -1 and weight_range[0] == weight_range[1] and
+        height_range[0] != -1 and height_range[0] == height_range[1]
+    )
+
+    if is_single_person:
+        print("   -> Single-person request detected. Using KNN fast-path.")
+
+        # Sex pre-filter (hard for single person)
+        sex = sf.get('sex', 'any')
+        knn_pool = df[df['sex'].str.lower() == sex.lower()].copy() if sex != 'any' else df.copy()
+        if knn_pool.empty:
+            knn_pool = df.copy()  # fallback: ignore sex if pool is empty
+
+        # Build feature matrix — normalize each dimension by a typical scale
+        target_w = weight_range[0]
+        target_h = height_range[0]
+        target_a = (age_range[0] + age_range[1]) / 2 if age_range[0] != -1 else None
+
+        dist = np.zeros(len(knn_pool))
+        if 'weight (kg)' in knn_pool.columns:
+            dist += ((knn_pool['weight (kg)'].values - target_w) / 20.0) ** 2
+        if 'height (m)' in knn_pool.columns:
+            dist += ((knn_pool['height (m)'].values - target_h) / 0.15) ** 2
+        if target_a is not None and 'Min Age (year)' in knn_pool.columns:
+            mid_age = (knn_pool['Min Age (year)'].values + knn_pool['Max Age (year)'].values) / 2
+            dist += ((mid_age - target_a) / 15.0) ** 2
+
+        best_idx    = int(np.argmin(dist))
+        selected_df = knn_pool.iloc[[best_idx]]
+        reasoning   = (
+            f"KNN: single-person match for weight={target_w}kg, "
+            f"height={target_h}m" + (f", age≈{target_a:.0f}yr" if target_a else "")
+        )
+        print(f"   -> KNN picked: {knn_pool.iloc[best_idx].get('Filename', best_idx)}")
+
+        # Build and return output immediately
+        results = []
+        for _, row in selected_df.iterrows():
+            raw_dir = row.get('Directory', '')
+            if pd.isna(raw_dir):
+                continue
+            clean_path = f"{str(raw_dir).replace(chr(92), '/').lstrip('./')}/{row['Filename']}"
+            results.append({**row.to_dict(), "full_path": clean_path})
+        if results:
+            msg = f"Model Selection Complete (KNN). Found {len(results)} model(s). {reasoning}"
+            return {"selected_models": results, "current_status": msg}
+        # If something went wrong building output, fall through to LLM loop
+
+    # ── 4. Three-pass widening LLM loop ───────────────────────────────────────
+    # Each pass has a different tolerance profile. We stop as soon as we get results.
+    passes = [
+        {
+            "label": "Pass 1 (tight)",
+            "age_tol": 5, "weight_tol": 5, "height_tol": 0.05,
+            "sex_rule": "match strictly (male/female). Only deviate if literally 0 options exist.",
+            "count_rule": "For a single subject: 1-2 closest matches. For a range: rows within the range.",
+        },
+        {
+            "label": "Pass 2 (moderate)",
+            "age_tol": 10, "weight_tol": 10, "height_tol": 0.08,
+            "sex_rule": "strong preference but NOT a hard filter — include nearest opposite-sex if the same-sex pool is very small.",
+            "count_rule": "For a single subject: best 1-3 matches. For a range: rows within or near the range.",
+        },
+        {
+            "label": "Pass 3 (wide — last resort)",
+            "age_tol": 20, "weight_tol": 20, "height_tol": 0.15,
+            "sex_rule": "treat as a soft preference only. Include any reasonably close row regardless of sex.",
+            "count_rule": "Return a representative set of 2-5 rows. Prioritize holistic closeness over any single dimension.",
+        },
+    ]
+
+    selected_df = pd.DataFrame()
+    reasoning   = ""
+
+    # Init LLM client once
+    if MODEL == 'openai':
+        client = OpenAI(api_key=keys['openai_api_key'])
+    elif MODEL == 'gemini':
+        genai.configure(api_key=keys['gemini_api_key'])
+
+    for pass_cfg in passes:
+        print(f"   -> {pass_cfg['label']}: querying LLM...")
+
+        selection_prompt = f"""
+You are a biomechanics model database expert.
+
+USER REQUEST: "{user_prompt}"
+
+EXTRACTED SUBJECT CONSTRAINTS:
+{json.dumps(subject_filter, indent=2)}
+
+FULL MODEL DATABASE (index on the left):
+{db_summary}
+
+YOUR TASK:
+- Select which row index(es) BEST match the user's subject description.
+- {pass_cfg['count_rule']}
+- NEVER return an empty list — always return at least 1 index.
+- **MAX 10 MODELS**: Do NOT return more than 10, unless the user clearly requests all models / the entire database.
+
+TOLERANCES FOR THIS ATTEMPT:
+- sex: {pass_cfg['sex_rule']}
+- age: ±{pass_cfg['age_tol']} years tolerance.
+- weight: ±{pass_cfg['weight_tol']} kg tolerance.
+- height: ±{pass_cfg['height_tol']} m tolerance.
+- Holistic closeness matters more than any single dimension being exact.
+
+Return ONLY valid JSON, no explanation outside the JSON.
+
+OUTPUT FORMAT:
+{{
+  "selected_indices": [0, 5, 12],
+  "reasoning": "One sentence why these were chosen."
+}}
+"""
+
+        try:
+            content = ""
+            if MODEL == 'openai':
+                response = client.chat.completions.create(
+                    model=MODEL_TYPE,
+                    messages=[
+                        {"role": "system", "content": "You are a data selection assistant. Output strictly valid JSON."},
+                        {"role": "user",   "content": selection_prompt}
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0
+                )
+                content = response.choices[0].message.content
+
+            elif MODEL == 'gemini':
+                gem_model = genai.GenerativeModel(MODEL_TYPE)
+                response  = gem_model.generate_content(selection_prompt)
+                content   = response.text.replace('```json', '').replace('```', '').strip()
+
+            result    = json.loads(content)
+            indices   = result.get('selected_indices', [])
+            reasoning = result.get('reasoning', '')
+
+            # Hard cap at 10
+            no_limit = result.get('no_limit', False)
+            if not no_limit and len(indices) > 10:
+                indices = indices[:10]
+                reasoning += " (capped to 10 models)"
+
+            print(f"      -> Indices: {indices} | {reasoning}")
+
+            valid_indices = [i for i in indices if isinstance(i, int) and 0 <= i < len(df)]
+            if valid_indices:
+                selected_df = df.iloc[valid_indices]
+                print(f"      -> {pass_cfg['label']} succeeded with {len(valid_indices)} model(s).")
+                break  # Stop — we have results
             else:
-                context_df = df
-            
-            if context_df.empty:
-                return {"final_message": f"Error: No models exist for sex='{sex_filter}'."}
+                print(f"      -> No valid indices returned, escalating...")
 
-            stats = {
-                "min_age": float(context_df['Min Age (year)'].min()),
-                "max_age": float(context_df['Max Age (year)'].max()),
-                "min_weight": float(context_df['weight (kg)'].min()),
-                "max_weight": float(context_df['weight (kg)'].max()),
-                "min_height": float(context_df['height (m)'].min()),
-                "max_height": float(context_df['height (m)'].max())
-            }
+        except Exception as e:
+            print(f"      -> LLM error on {pass_cfg['label']}: {e}, escalating...")
 
-            prompt = f"""
-            You are a Data Logic Assistant.
-            GOAL: Adjust the search filters to find at least one model.
-            
-            CURRENT FILTERS (Failed):
-            {json.dumps(current_filters, indent=2)}
-            
-            DATABASE STATS (Actual Data Range):
-            {json.dumps(stats, indent=2)}
-            
-            TASK:
-            Relax the 'age_range', 'weight_range', or 'height_range' so they overlap with the Database Stats.
-            - If the user wanted [70, 70] but data is 60-80, widen to [65, 75].
-            - If the user request is completely out of bounds, shift it towards the min/max of the DB.
-            - Keep 'sex' unchanged.
-            
-            OUTPUT:
-            Return ONLY a valid JSON object with the updated filters. 
-            Example: {{"sex": "male", "age_range": [20, 30], "weight_range": [70, 80], "height_range": [1.7, 1.8]}}
-            """
-
-            # Call LLM
-            try:
-                content = ""
-                if MODEL == 'openai':
-                    response = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": prompt}],
-                        response_format={"type": "json_object"},
-                        temperature=0
-                    )
-                    content = response.choices[0].message.content
-                elif MODEL == 'gemini':
-                    model = genai.GenerativeModel("gemini-2.0-flash-exp")
-                    response = model.generate_content(prompt)
-                    content = response.text.replace('```json', '').replace('```', '').strip()
-                
-                # Apply new filters
-                new_filters = json.loads(content)
-                current_filters.update(new_filters)
-                print(f"   -> LLM Adjusted Filters: {current_filters}")
-                
-            except Exception as e:
-                print(f"   -> LLM Error: {e}")
-                break
-
-    # --- FINAL OUTPUT ---
+    # ── 5. Python fallback: distance scoring (only if all 3 passes failed) ────
     if selected_df.empty:
-        return {"final_message": "Error: No models found matching criteria after 3 attempts."}
+        print("   -> All LLM passes failed. Running Python distance-score fallback...")
+        sf = subject_filter
 
+        if sf.get('sex', 'any') != 'any':
+            fallback_df = df[df['sex'].str.lower() == sf['sex'].lower()].copy()
+        else:
+            fallback_df = df.copy()
+
+        if fallback_df.empty:
+            fallback_df = df.copy()
+
+        scores       = np.zeros(len(fallback_df))
+        age_range    = sf.get('age_range',    [-1, -1])
+        weight_range = sf.get('weight_range', [-1, -1])
+        height_range = sf.get('height_range', [-1, -1])
+
+        target_a = (age_range[0]    + age_range[1])    / 2 if age_range[0]    != -1 else -1
+        target_w = (weight_range[0] + weight_range[1]) / 2 if weight_range[0] != -1 else -1
+        target_h = (height_range[0] + height_range[1]) / 2 if height_range[0] != -1 else -1
+
+        if target_a != -1 and 'Min Age (year)' in fallback_df.columns:
+            mid = (fallback_df['Min Age (year)'].values + fallback_df['Max Age (year)'].values) / 2
+            scores += np.abs(mid - target_a) / 10.0
+        if target_w != -1 and 'weight (kg)' in fallback_df.columns:
+            scores += np.abs(fallback_df['weight (kg)'].values - target_w) / 10.0
+        if target_h != -1 and 'height (m)' in fallback_df.columns:
+            scores += np.abs(fallback_df['height (m)'].values - target_h) / 0.10
+
+        best_idx    = int(scores.argmin())
+        selected_df = fallback_df.iloc[[best_idx]]
+        reasoning   = "Fallback: closest match by distance score."
+        print(f"   -> Fallback picked row index {fallback_df.index[best_idx]}")
+
+    # ── 6. Build output ───────────────────────────────────────────────────────
     results = []
     for _, row in selected_df.iterrows():
-        raw_dir = row['Directory']
-        if pd.isna(raw_dir): continue
-        clean_path = f"{str(raw_dir).replace('\\', '/').lstrip('./')}/{row['Filename']}"
+        raw_dir = row.get('Directory', '')
+        if pd.isna(raw_dir):
+            continue
+        clean_path = f"{str(raw_dir).replace(chr(92), '/').lstrip('./')}/{row['Filename']}"
         results.append({**row.to_dict(), "full_path": clean_path})
 
-    msg = f"Model Selection Complete. Found {len(results)} model(s)."
+    if not results:
+        return {"final_message": "Error: No valid models could be selected."}
+
+    msg = f"Model Selection Complete. Found {len(results)} model(s). {reasoning}"
     return {"selected_models": results, "current_status": msg}
+
+
+
+
+# def model_selection_node(state):
+#     """
+#     Node 2: The 'Selector'. 
+#     1. Tries to find models using strict Python logic.
+#     2. If 0 found, asks LLM to adjust criteria based on DB stats.
+#     3. Retries up to 3 times.
+#     """
+#     print(f"--- Node 2: Selecting Model ({MODEL}) ---")
+    
+#     # 1. Setup Data & Config
+#     analysis = state.get('analysis_result')
+#     if not analysis or 'subject_filter' not in analysis:
+#         return {"final_message": "Error: Missing subject analysis."}
+    
+#     # Deep copy filters to allow modification
+#     current_filters = {
+#         'sex': analysis['subject_filter']['sex'],
+#         'age_range': list(analysis['subject_filter']['age_range']),
+#         'weight_range': list(analysis['subject_filter']['weight_range']),
+#         'height_range': list(analysis['subject_filter']['height_range'])
+#     }
+
+#     # Load Database
+#     try:
+#         csv_path = os.path.join(os.getcwd(), 'opensim_files', 'ms_model_details.csv')
+#         df = pd.read_csv(csv_path)
+#         df.columns = df.columns.str.strip()
+#     except Exception as e:
+#         return {"final_message": f"Error reading CSV: {e}"}
+
+#     # --- HELPER: Pure Python Filtering Logic ---
+#     def apply_filters(df_in, filters_in):
+#         # 1. Sex Filter
+#         if filters_in['sex'] != 'any':
+#             df_out = df_in[df_in['sex'].str.lower() == filters_in['sex'].lower()]
+#         else:
+#             df_out = df_in.copy()
+            
+#         if df_out.empty: return df_out
+
+#         # 2. Check Mode
+#         # If min != max for any metric, we treat it as a "Range/Batch" request
+#         is_batch = (filters_in['age_range'][0] != filters_in['age_range'][1] or 
+#                     filters_in['weight_range'][0] != filters_in['weight_range'][1] or 
+#                     filters_in['height_range'][0] != filters_in['height_range'][1])
+        
+#         if is_batch:
+#             mask = pd.Series(True, index=df_out.index)
+#             # Age
+#             mn, mx = filters_in['age_range']
+#             if mn != -1: mask &= (df_out['Min Age (year)'] <= mx) & (df_out['Max Age (year)'] >= mn)
+#             # Weight
+#             mn, mx = filters_in['weight_range']
+#             if mn != -1: mask &= (df_out['weight (kg)'] >= mn) & (df_out['weight (kg)'] <= mx)
+#             # Height
+#             mn, mx = filters_in['height_range']
+#             if mn != -1: mask &= (df_out['height (m)'] >= mn) & (df_out['height (m)'] <= mx)
+#             return df_out[mask]
+        
+#         else:
+#             # Single Best Match Logic (Distance Metric)
+#             target_a, target_w, target_h = filters_in['age_range'][0], filters_in['weight_range'][0], filters_in['height_range'][0]
+#             scores = np.zeros(len(df_out))
+            
+#             if target_a != -1:
+#                 mid = (df_out['Min Age (year)'].values + df_out['Max Age (year)'].values) / 2
+#                 scores += np.abs(mid - target_a) / 10.0
+#             if target_w != -1: scores += np.abs(df_out['weight (kg)'].values - target_w) / 10.0
+#             if target_h != -1: scores += np.abs(df_out['height (m)'].values - target_h) / 0.10
+            
+#             best_idx = scores.argmin()
+#             return df_out.iloc[[best_idx]]
+
+#     # --- REFLECTION LOOP ---
+#     max_retries = 3
+#     selected_df = pd.DataFrame()
+
+#     # Load API Keys once
+#     try:
+#         with open('info_and_keys.json') as f: keys = json.load(f)
+#         if MODEL == 'openai': client = OpenAI(api_key=keys['openai_api_key'])
+#         elif MODEL == 'gemini': genai.configure(api_key=keys['gemini_api_key'])
+#     except:
+#         return {"final_message": "Error: API Keys missing."}
+
+#     for attempt in range(1, max_retries + 1):
+#         print(f"-> Attempt {attempt}: Filtering...")
+        
+#         # A. Try Python Logic
+#         selected_df = apply_filters(df, current_filters)
+        
+#         if not selected_df.empty:
+#             print(f"   -> Success: Found {len(selected_df)} models.")
+#             break
+        
+#         # B. IF FAILED: Ask LLM to adjust parameters
+#         if attempt < max_retries:
+#             print("   -> No models found. Asking LLM to adjust filters...")
+            
+#             # Calculate DB Stats for Context (filtered by sex first)
+#             sex_filter = current_filters['sex']
+#             if sex_filter != 'any':
+#                 context_df = df[df['sex'].str.lower() == sex_filter.lower()]
+#             else:
+#                 context_df = df
+            
+#             if context_df.empty:
+#                 return {"final_message": f"Error: No models exist for sex='{sex_filter}'."}
+
+#             stats = {
+#                 "min_age": float(context_df['Min Age (year)'].min()),
+#                 "max_age": float(context_df['Max Age (year)'].max()),
+#                 "min_weight": float(context_df['weight (kg)'].min()),
+#                 "max_weight": float(context_df['weight (kg)'].max()),
+#                 "min_height": float(context_df['height (m)'].min()),
+#                 "max_height": float(context_df['height (m)'].max())
+#             }
+
+#             prompt = f"""
+#             You are a Data Logic Assistant.
+#             GOAL: Adjust the search filters to find at least one model.
+            
+#             CURRENT FILTERS (Failed):
+#             {json.dumps(current_filters, indent=2)}
+            
+#             DATABASE STATS (Actual Data Range):
+#             {json.dumps(stats, indent=2)}
+            
+#             TASK:
+#             Relax the 'age_range', 'weight_range', or 'height_range' so they overlap with the Database Stats.
+#             - If the user wanted [70, 70] but data is 60-80, widen to [65, 75].
+#             - If the user request is completely out of bounds, shift it towards the min/max of the DB.
+#             - Keep 'sex' unchanged.
+            
+#             OUTPUT:
+#             Return ONLY a valid JSON object with the updated filters. 
+#             Example: {{"sex": "male", "age_range": [20, 30], "weight_range": [70, 80], "height_range": [1.7, 1.8]}}
+#             """
+
+#             # Call LLM
+#             try:
+#                 content = ""
+#                 if MODEL == 'openai':
+#                     response = client.chat.completions.create(
+#                         model="gpt-4o-mini",
+#                         messages=[{"role": "user", "content": prompt}],
+#                         response_format={"type": "json_object"},
+#                         temperature=0
+#                     )
+#                     content = response.choices[0].message.content
+#                 elif MODEL == 'gemini':
+#                     model = genai.GenerativeModel("gemini-2.0-flash-exp")
+#                     response = model.generate_content(prompt)
+#                     content = response.text.replace('```json', '').replace('```', '').strip()
+                
+#                 # Apply new filters
+#                 new_filters = json.loads(content)
+#                 current_filters.update(new_filters)
+#                 print(f"   -> LLM Adjusted Filters: {current_filters}")
+                
+#             except Exception as e:
+#                 print(f"   -> LLM Error: {e}")
+#                 break
+
+#     # --- FINAL OUTPUT ---
+#     if selected_df.empty:
+#         return {"final_message": "Error: No models found matching criteria after 3 attempts."}
+
+#     results = []
+#     for _, row in selected_df.iterrows():
+#         raw_dir = row['Directory']
+#         if pd.isna(raw_dir): continue
+#         clean_path = f"{str(raw_dir).replace('\\', '/').lstrip('./')}/{row['Filename']}"
+#         results.append({**row.to_dict(), "full_path": clean_path})
+
+#     msg = f"Model Selection Complete. Found {len(results)} model(s)."
+#     return {"selected_models": results, "current_status": msg}
+
 
 
 
@@ -649,514 +944,84 @@ def data_processing_node(state):
         extract_rows(base_row, results.get('muscle_forces'), 'Muscle_Name', force_data)
         extract_rows(base_row, results.get('muscle_activations'), 'Muscle_Name', activation_data)
 
-    # 5. Return DataFrames in state
+    # 5. Build raw spinal DataFrame
+    spinal_df_raw = pd.DataFrame(spinal_data)
+
+    # 6. Post-process spinal DataFrame:
+    #    a) Filter to IVDjnt loads only
+    #    b) Pivot _fx / _fy / _fz rows into wide format columns
+    #    c) Extract Joint label (e.g. 'L5_S1') from Load_Name
+    if not spinal_df_raw.empty:
+        # Keep only IVDjnt rows
+        spinal_df_ivd = spinal_df_raw[
+            spinal_df_raw['Load_Name'].str.contains('IVDjnt', na=False)
+        ].copy()
+
+        if not spinal_df_ivd.empty:
+            # Determine the force direction suffix (_fx, _fy, _fz)
+            spinal_df_ivd['force_dir'] = spinal_df_ivd['Load_Name'].str.extract(
+                r'_(fx|fy|fz)$', expand=False
+            )
+
+            # Build a base key = Load_Name without the trailing _fx/_fy/_fz
+            spinal_df_ivd['load_base'] = spinal_df_ivd['Load_Name'].str.replace(
+                r'_(fx|fy|fz)$', '', regex=True
+            )
+
+            # Extract Joint label: first two underscore-separated parts (e.g. 'L5_S1')
+            spinal_df_ivd['Joint'] = spinal_df_ivd['load_base'].str.split('_').str[:2].str.join('_')
+
+            # Pivot force directions into columns
+            id_cols = ['Model', 'Activity', 'Age', 'Weight_kg', 'Height_m', 'Joint', 'load_base']
+            pivot_cols = [c for c in id_cols if c in spinal_df_ivd.columns]
+
+            spinal_wide = spinal_df_ivd.pivot_table(
+                index=pivot_cols,
+                columns='force_dir',
+                values='Value',
+                aggfunc='first'
+            ).reset_index()
+
+            # Rename pivoted columns to force_fx / force_fy / force_fz
+            rename_map = {c: f'force_{c}' for c in ['fx', 'fy', 'fz'] if c in spinal_wide.columns}
+            spinal_wide.rename(columns=rename_map, inplace=True)
+            spinal_wide.columns.name = None  # clean up MultiIndex name
+
+            # Drop the helper column
+            spinal_wide.drop(columns=['load_base'], inplace=True, errors='ignore')
+
+            spinal_df_final = spinal_wide
+        else:
+            spinal_df_final = spinal_df_ivd
+    else:
+        spinal_df_final = spinal_df_raw
+
+    # 7. Return DataFrames in state
+    # Drop row 0 (time=0 initial condition) from muscle results
+    forces_df      = pd.DataFrame(force_data)
+    activations_df = pd.DataFrame(activation_data)
+
+    if len(forces_df) > 1:
+        forces_df = forces_df.iloc[1:].reset_index(drop=True)
+    if len(activations_df) > 1:
+        activations_df = activations_df.iloc[1:].reset_index(drop=True)
+
+    # Enrich & clean muscle DataFrames (filter non-muscles, add anatomical metadata)
+    try:
+        forces_df      = filter_and_enrich(forces_df,      muscle_col='Muscle_Name')
+        activations_df = filter_and_enrich(activations_df, muscle_col='Muscle_Name')
+        print(f"   -> Enrichment done: {len(forces_df)} force rows, {len(activations_df)} activation rows kept.")
+    except Exception as enrich_err:
+        print(f"   -> Muscle enrichment warning: {enrich_err} (proceeding without enrichment)")
+
     return {
         "dataframes": {
-            "spinal": pd.DataFrame(spinal_data),
-            "forces": pd.DataFrame(force_data),
-            "activations": pd.DataFrame(activation_data)
+            "spinal":      spinal_df_final,
+            "forces":      forces_df,
+            "activations": activations_df
         },
         "current_status": "Data processed into DataFrames."
     }
-
-
-
-# def analysis_agent_node(state):
-#     """
-#     Node 5: The 'Analyst'. Connects to Chat logic using Pandas Dataframe Agents.
-#     Integrates the specific prompt logic provided in utils.
-#     """
-#     print("--- Node 5: Agentic Analysis (Chat) ---")
-    
-#     dfs = state.get('dataframes')
-#     if not dfs:
-#         return {"final_message": "Error: No data available for analysis."}
-
-#     # 1. Load Keys
-#     try:
-#         with open('info_and_keys.json') as f:
-#             keys = json.load(f)
-#     except:
-#         return {"final_message": "Error loading keys for analysis agent."}
-
-#     # 2. Init LLM
-#     if MODEL == 'openai':
-#         llm = ChatOpenAI(model=MODEL_TYPE, api_key=keys["openai_api_key"])
-#     else:
-#         llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash-exp", google_api_key=keys["gemini_api_key"])
-
-#     # 3. Define Domain Knowledge (Prefixes)
-#     domain_knowledge = """
-#     You are a Biomechanics Assistant analyzing OpenSim data.
-    
-#     DATA DEFINITIONS:
-#     1. SPINAL LOADS:
-#        - *_fy = Compression forces (Vertical).
-#        - *_fx, *_fz = Shear forces (Horizontal).
-#        - T1_T2...L5_S1 = Spinal joints.
-    
-#     2. MUSCLE FORCES (Newtons) & ACTIVATIONS (0.0-1.0):
-#        - Suffixes: '_r'/'_R' = Right, '_l'/'_L' = Left.
-#        - No suffix usually implies Right/Primary.
-#        - Groups: 
-#          * Psoas ('Ps_...')
-#          * Iliocostalis ('IL_...')
-#          * Longissimus ('LTpT_...', 'LTpL_...')
-#          * Quadratus Lumborum ('QL_...')
-#          * Multifidus ('MF_...')
-#          * Abdominals ('rect_abd', 'IO', 'EO')
-#     """
-
-#     # 4. Create Agent 
-#     # We allow the agent to see all 3 DataFrames to cross-reference if needed
-#     agent = create_pandas_dataframe_agent(
-#         llm=llm,
-#         df=[dfs['spinal'], dfs['forces'], dfs['activations']],
-#         verbose=True,
-#         allow_dangerous_code=True, # Required for Pandas Agent
-#         agent_type="openai-tools",
-#         handle_parsing_errors=True,
-#         prefix=domain_knowledge
-#     )
-
-#     # 5. Construct Query
-#     # We combine the User's original intent + a request for summary
-
-#     plot_instructions = """
-#     Only if asked for plotting; otherwise, ignore: RULES FOR PLOTTING (MUST FOLLOW STICTLY):
-#     1. SETUP:
-#        - You MUST use `plt.switch_backend('Agg')` at the start of your code to prevent GUI errors.
-#        - Use `plt.figure(figsize=(10, 6))` for legibility.
-#        - Use `plt.style.use('ggplot')` for professional formatting.
-       
-#     2. DATA SELECTION:
-#        - Always verify the exact column name exists in `df.columns` before plotting. Use fuzzy matching if needed (e.g., if user asks for "L5 compression", look for "L5_S1_fy").
-#        - The X-Axis must ALWAYS be the 'time' column.
-    
-#     3. RENDERING:
-#        - clear the figure with `plt.clf()` before plotting.
-#        - Add a title, X-label ('Time [s]'), and Y-label (with units like 'Newtons' or 'Activation').
-#        - If plotting multiple muscles, include a legend.
-       
-#     4. SAVING:
-#        - You MUST save the file to: 'static/generated_plot.png' (Create the directory if it doesn't exist).
-#        - Use `plt.savefig('static/generated_plot.png', dpi=300, bbox_inches='tight')`.
-#        - DO NOT use `plt.show()`.
-    
-#     5. OUTPUT:
-#        - After saving, your final answer MUST confirm: "Plot saved to static/generated_plot.png".
-#        - Provide a brief 1-sentence interpretation of the peak values in the plot.
-#     """
-
-#     query = (
-#         f"The user asked: '{state['user_prompt']}'.\n"
-#         "1. Analyze the provided DataFrames (df1=Spinal, df2=Forces, df3=Activations).\n"
-#         "2. If the user asks for a PLOT or GRAPH:\n"
-#         f"{plot_instructions}\n"
-#         "3. Provide a text summary of what the plot shows."
-#     )
-
-#     try:
-#         response = agent.invoke({"input": query})
-#         output_text = response["output"] if isinstance(response, dict) else str(response)
-#         return {"final_message": output_text}
-#     except Exception as e:
-#         return {"final_message": f"Analysis Agent Error: {e}"}
-
-
-
-
-# def analysis_agent_node(state):
-#     """
-#     Node 5: The 'Analyst'. 
-#     Architecture:
-#     1. PLANNER LLM: Reads history -> Decides which of the 3 DataFrames to use.
-#     2. ROUTER: Activates ONLY the specific agent for that DataFrame.
-#     3. SPECIALIST AGENT: executes the query with strict domain knowledge.
-#     """
-#     print(f"--- Node 5: Agentic Analysis ({MODEL}) ---")
-    
-#     dfs = state.get('dataframes')
-#     if not dfs:
-#         return {"final_message": "Error: No data available for analysis."}
-    
-#     # 1. Load Keys & Init LLM (STRICTLY USING YOUR GLOBALS)
-#     try:
-#         with open('info_and_keys.json') as f: 
-#             keys = json.load(f)
-        
-#         if MODEL == 'openai':
-#             llm = ChatOpenAI(
-#                 model=MODEL_TYPE, 
-#                 api_key=keys["openai_api_key"], 
-#                 temperature=0
-#             )
-#         elif MODEL == 'gemini':
-#             llm = ChatGoogleGenerativeAI(
-#                 model=MODEL_TYPE, 
-#                 google_api_key=keys["gemini_api_key"], 
-#                 temperature=0
-#             )
-#         else:
-#             return {"final_message": f"Error: Unknown MODEL configuration '{MODEL}'"}
-            
-#     except Exception as e:
-#         return {"final_message": f"Config/LLM Init Error: {e}"}
-
-#     # 2. Prepare Context
-#     chat_history = state.get('chat_context', "No prior history.")
-#     user_input = state.get('user_prompt', "")
-
-#     # ==================================================================================
-#     # STEP 1: THE PLANNER (Decide Intent & DataFrame)
-#     # ==================================================================================
-#     planner_prompt = f"""
-#     You are the "Planner". 
-    
-#     CONTEXT:
-#     User Input: "{user_input}"
-#     Chat History: 
-#     {chat_history}
-    
-#     AVAILABLE AGENTS / DATAFRAMES:
-#     1. 'spinal': For spinal joint loads (Compression/Shear).
-#        - Columns: ['Model', 'Activity', 'Load_Name', 'Value']
-#     2. 'forces': For specific muscle forces (Newtons).
-#        - Columns: ['Model', 'Activity', 'Muscle_Name', 'Value']
-#     3. 'activations': For muscle activation levels (0.0 to 1.0).
-#        - Columns: ['Model', 'Activity', 'Muscle_Name', 'Value']
-    
-#     YOUR TASK:
-#     1. Analyze what the user is asking for.
-#     2. Select ONE agent ('spinal', 'forces', or 'activations').
-#     3. Write a specific instruction for that agent.
-    
-#     RULES:
-#     - If the user asks for "L5 compression" or "Shear", choose 'spinal'.
-#     - If the user asks for "Longissimus" or "Psoas" force, choose 'forces'.
-#     - If the user asks for "Effort" or "Activation", choose 'activations'.
-#     - If vague, default to 'spinal' with a summary request.
-    
-#     OUTPUT JSON ONLY:
-#     {{
-#         "target_agent": "spinal" | "forces" | "activations",
-#         "instruction": "Precise instruction for the coding agent..."
-#     }}
-#     """
-    
-#     try:
-#         response = llm.invoke(planner_prompt)
-#         # Clean markdown
-#         content = response.content.replace('```json', '').replace('```', '').strip()
-#         plan = json.loads(content)
-        
-#         target = plan.get('target_agent', 'spinal')
-#         instruction = plan.get('instruction', 'Summarize the data.')
-        
-#         print(f"[Planner] Decided: {target.upper()}")
-#         print(f"[Planner] Task: {instruction}")
-        
-#     except Exception as e:
-#         print(f"Planner Error: {e}")
-#         target = "spinal"
-#         instruction = "Summarize the spinal load data."
-
-#     # ==================================================================================
-#     # STEP 2 & 3: DEFINE AND SELECT THE SPECIFIC AGENT
-#     # ==================================================================================
-    
-#     # Common Plotting Rules for all agents
-#     plot_rules = """
-#     IF PLOTTING:
-#     - You MUST use `plt.switch_backend('Agg')` first.
-#     - `plt.clf()` to clear.
-#     - Save to 'static/generated_plot.png'.
-#     - DO NOT use `plt.show()`.
-#     """
-
-#     selected_df = None
-#     agent_prefix = ""
-
-#     # --- AGENT A: SPINAL AGENT ---
-#     if target == 'spinal':
-#         selected_df = dfs['spinal']
-#         agent_prefix = f"""
-#         You are the SPINAL LOAD SPECIALIST.
-        
-#         YOUR DATA (`df`):
-#         - Format: Long format (Rows are individual measurements).
-#         - Columns: ['Model', 'Activity', 'Age', 'Weight_kg', 'Height_m', 'Load_Name', 'Value']
-        
-#         DOMAIN KNOWLEDGE:
-#         - `Load_Name` contains the joint and direction.
-#         - `_fy` suffix = Compression Forces (Vertical).
-#         - `_fx` or `_fz` suffix = Shear Forces (Horizontal).
-#         - `Value` is in Newtons.
-        
-#         TASK: {instruction}
-        
-#         TIPS:
-#         - To find L5 Compression: Filter `df` where `Load_Name` contains 'L5' and 'fy'.
-#         - {plot_rules}
-#         """
-
-#     # --- AGENT B: MUSCLE FORCES AGENT ---
-#     elif target == 'forces':
-#         selected_df = dfs['forces']
-#         agent_prefix = f"""
-#         You are the MUSCLE FORCE SPECIALIST.
-        
-#         YOUR DATA (`df`):
-#         - Format: Long format.
-#         - Columns: ['Model', 'Activity', 'Age', 'Weight_kg', 'Height_m', 'Muscle_Name', 'Value']
-#         - `Value` is Force in Newtons.
-        
-#         MUSCLE NAMING CONVENTION (in `Muscle_Name`):
-#         - Suffixes: '_l' or '_L' (Left), '_r' or '_R' (Right).
-#         - No suffix usually implies Right.
-#         - Groups (Prefixes):
-#           * 'Ps_' = Psoas
-#           * 'IL_' = Iliocostalis
-#           * 'LTpT_', 'LTpL_' = Longissimus (Thoracic/Lumbar)
-#           * 'QL_' = Quadratus Lumborum
-#           * 'MF_' = Multifidus
-#           * 'rect_abd', 'IO', 'EO' = Abdominals
-        
-#         TASK: {instruction}
-        
-#         TIPS:
-#         - Use string contains to filter groups (e.g. `df[df['Muscle_Name'].str.contains('LTp')]`).
-#         - {plot_rules}
-#         """
-
-#     # --- AGENT C: ACTIVATIONS AGENT ---
-#     elif target == 'activations':
-#         selected_df = dfs['activations']
-#         agent_prefix = f"""
-#         You are the MUSCLE ACTIVATION SPECIALIST.
-        
-#         YOUR DATA (`df`):
-#         - Format: Long format.
-#         - Columns: ['Model', 'Activity', 'Age', 'Weight_kg', 'Height_m', 'Muscle_Name', 'Value']
-#         - `Value` is Activation (0.0 to 1.0). 1.0 = Max effort.
-        
-#         MUSCLE NAMING CONVENTION:
-#         - Suffixes: '_l' (Left), '_r' (Right).
-#         - Groups: 'Ps_' (Psoas), 'IL_' (Iliocostalis), 'LTpT_'/'LTpL_' (Longissimus), 'QL_' (Quad Lumb), 'MF_' (Multifidus).
-        
-#         TASK: {instruction}
-        
-#         TIPS:
-#         - {plot_rules}
-#         """
-
-#     # Sanity Check
-#     if selected_df is None or selected_df.empty:
-#         return {"final_message": f"Error: The chosen dataframe ({target}) is empty or missing."}
-
-#     # ==================================================================================
-#     # STEP 4: EXECUTE THE CHOSEN AGENT
-#     # ==================================================================================
-#     try:
-#         agent = create_pandas_dataframe_agent(
-#             llm=llm,
-#             df=selected_df,
-#             verbose=True,
-#             allow_dangerous_code=True,
-#             agent_type="openai-tools",
-#             handle_parsing_errors=True,
-#             prefix=agent_prefix
-#         )
-
-#         response = agent.invoke({"input": instruction})
-#         output_text = response["output"] if isinstance(response, dict) else str(response)
-        
-#         # Check for plot file creation hint
-#         if "plot" in instruction.lower() and "saved" not in output_text.lower():
-#              output_text += "\n(Note: Check the dashboard for the generated plot.)"
-             
-#         return {"final_message": output_text}
-        
-#     except Exception as e:
-#         return {"final_message": f"Analysis Error in {target.upper()} agent: {e}"}
-
-
-
-# def analysis_agent_node(state):
-#     """
-#     Node 5: The 'Analyst'. 
-#     - USES: 3-Agent Architecture (Planner -> Specialist).
-#     - FIXES: "I don't have dataframe" errors (via strict system prompts).
-#     - RESTORED: Full Domain Knowledge for mapping 'Psoas' -> 'Ps_', etc.
-#     """
-#     print(f"--- Node 5: Agentic Analysis ({MODEL}) ---")
-    
-#     dfs = state.get('dataframes')
-#     if not dfs:
-#         return {"final_message": "Error: No data available for analysis."}
-    
-#     # 1. Load Keys & Init LLM
-#     try:
-#         with open('info_and_keys.json') as f: 
-#             keys = json.load(f)
-        
-#         if MODEL == 'openai':
-#             llm = ChatOpenAI(
-#                 model=MODEL_TYPE, 
-#                 api_key=keys["openai_api_key"], 
-#                 temperature=0
-#             )
-#         elif MODEL == 'gemini':
-#             llm = ChatGoogleGenerativeAI(
-#                 model=MODEL_TYPE, 
-#                 google_api_key=keys["gemini_api_key"], 
-#                 temperature=0
-#             )
-#         else:
-#             return {"final_message": f"Error: Unknown MODEL configuration '{MODEL}'"}
-            
-#     except Exception as e:
-#         return {"final_message": f"Config/LLM Init Error: {e}"}
-
-#     # 2. Context
-#     chat_history = state.get('chat_context', "No prior history.")
-#     user_input = state.get('user_prompt', "")
-
-#     # ==================================================================================
-#     # STEP 1: THE PLANNER
-#     # ==================================================================================
-#     planner_prompt = f"""
-#     You are the "Planner".
-    
-#     USER INPUT: "{user_input}"
-#     CHAT HISTORY: 
-#     {chat_history}
-    
-#     AVAILABLE DATAFRAMES:
-#     1. 'spinal' (Columns: Model, Activity, Load_Name, Value)
-#     2. 'forces' (Columns: Model, Activity, Muscle_Name, Value)
-#     3. 'activations' (Columns: Model, Activity, Muscle_Name, Value)
-    
-#     TASK:
-#     1. Select ONE dataframe ('spinal', 'forces', or 'activations').
-#     2. Write a Python-focused instruction.
-    
-#     RULES:
-#     - If user asks for "L5 compression" or "Shear", use 'spinal'.
-#     - If user asks for "Muscle Force" (Newtons), use 'forces'.
-#     - If user asks for "Activation", "Effort" or "Recruitment" (0-1), use 'activations'.
-#     - If plotting is needed, explicitly say: "Plot the data and save to static/generated_plot.png".
-    
-#     OUTPUT JSON ONLY:
-#     {{
-#         "target_agent": "spinal" | "forces" | "activations",
-#         "instruction": "Exact instruction for the agent..."
-#     }}
-#     """
-    
-#     try:
-#         response = llm.invoke(planner_prompt)
-#         content = response.content.replace('```json', '').replace('```', '').strip()
-#         plan = json.loads(content)
-#         target = plan.get('target_agent', 'spinal')
-#         instruction = plan.get('instruction', 'Summarize data.')
-#         print(f"[Planner] Target: {target} | Instruction: {instruction}")
-        
-#     except Exception as e:
-#         print(f"Planner Error: {e}")
-#         target = "spinal"
-#         instruction = "Summarize the spinal load data."
-
-#     # ==================================================================================
-#     # STEP 2: CONFIGURE THE SPECIALIST AGENT (With Full Domain Knowledge)
-#     # ==================================================================================
-    
-#     selected_df = dfs.get(target)
-#     if selected_df is None or selected_df.empty:
-#         return {"final_message": f"Error: Dataframe '{target}' is empty."}
-
-#     # --- COMMON GUARDRAILS (The Fix for "I don't have data") ---
-#     base_prefix = f"""
-#     You are a Python Data Analyst. 
-    
-#     CRITICAL EXECUTION RULES:
-#     1. The dataframe is ALREADY LOADED in your environment as the variable `df`.
-#     2. DO NOT ask the user for data. DO NOT say "I don't have access". USE `df` DIRECTLY.
-#     3. You MUST execute Python code to answer. Do not just write the code; RUN IT.
-    
-#     PLOTTING RULES (IF ASKED):
-#     - Use `plt.switch_backend('Agg')` at the start.
-#     - `plt.clf()` to clear previous plots.
-#     - Save strictly to: 'static/generated_plot.png'
-#     - DO NOT use `plt.show()`.
-#     """
-
-#     # --- RESTORED DOMAIN KNOWLEDGE ---
-#     if target == 'spinal':
-#         system_prefix = base_prefix + """
-        
-#         DOMAIN KNOWLEDGE (SPINAL LOADS):
-#         - `Load_Name` format: [Joint]_[Direction]
-#         - COMPRESSION (Vertical): Look for suffix `_fy`. (e.g., 'L5_S1_fy')
-#         - SHEAR (Horizontal): Look for suffixes `_fx` or `_fz`.
-#         - JOINTS: 'T1_T2', ... 'L5_S1'.
-#         - UNITS: Newtons.
-        
-#         TIP: To find 'L5 Compression', filter where `Load_Name` contains 'L5' AND ends with '_fy'.
-#         """
-        
-#     elif target in ['forces', 'activations']:
-#         system_prefix = base_prefix + f"""
-        
-#         DOMAIN KNOWLEDGE (MUSCLES):
-#         - COLUMN: 'Muscle_Name'
-#         - SUFFIXES: `_r` or `_R` (Right Side), `_l` or `_L` (Left Side).
-#           (If no suffix is specified by user, assume Both or Right).
-        
-#         MUSCLE MAPPING (Prefix -> Muscle Group):
-#         * 'Ps_'    -> Psoas Major
-#         * 'IL_'    -> Iliocostalis (e.g., IL_L1_L2_r)
-#         * 'LTpT_'  -> Longissimus Thoracis
-#         * 'LTpL_'  -> Longissimus Lumborum
-#         * 'QL_'    -> Quadratus Lumborum
-#         * 'MF_'    -> Multifidus
-#         * 'rect_abd' -> Rectus Abdominis
-#         * 'IO_'    -> Internal Oblique
-#         * 'EO_'    -> External Oblique
-        
-#         VALUE DEFINITION:
-#         - If 'forces' agent: Units are Newtons.
-#         - If 'activations' agent: Units are 0.0 to 1.0 (Normalized).
-#         """
-
-#     # ==================================================================================
-#     # STEP 3: EXECUTE
-#     # ==================================================================================
-#     try:
-#         agent = create_pandas_dataframe_agent(
-#             llm=llm,
-#             df=selected_df,
-#             verbose=True,
-#             allow_dangerous_code=True,
-#             agent_type="openai-tools",  
-#             handle_parsing_errors=True,
-#             prefix=system_prefix
-#         )
-
-#         # Force the input to remind the agent AGAIN that df exists
-#         final_prompt = f"{instruction} (Recall: Data is in variable `df`)"
-        
-#         response = agent.invoke({"input": final_prompt})
-#         output_text = response["output"] if isinstance(response, dict) else str(response)
-
-#         # Check for plot success in the text
-#         if "plot" in instruction.lower() and "saved" not in output_text.lower():
-#             output_text += "\n(System Note: A plot was requested. Check the dashboard.)"
-            
-#         return {"final_message": output_text}
-
-#     except Exception as e:
-#         return {"final_message": f"Agent Execution Error: {e}"}
 
 
 
@@ -1251,45 +1116,93 @@ def analysis_agent_node(state):
     
     # Shared definition for Forces & Activations
     muscle_mapping_info = """
-        DOMAIN KNOWLEDGE (MUSCLES):
-        - COLUMN: 'Muscle_Name'
-        - SUFFIXES: `_r` or `_R` (Right Side), `_l` or `_L` (Left Side).
-          (If no suffix is specified by user, assume Both or Right).
-        -MUSCLE MAPPING (Prefix -> Muscle Group):
-            * 'Ps_'    -> Psoas Major
-            * 'IL_'    -> Iliocostalis (e.g., IL_L1_L2_r)
-            * 'LTpT_'  -> Longissimus Thoracis
-            * 'LTpL_'  -> Longissimus Lumborum
-            * 'QL_'    -> Quadratus Lumborum
-            * 'MF_'    -> Multifidus
-            * 'rect_abd' -> Rectus Abdominis
-            * 'IO1', 'IO2', ...    -> Internal Oblique
-            * 'E0_R5', 'E0_R6', ...    -> External Oblique
+        DOMAIN KNOWLEDGE (MUSCLES — enriched DataFrame):
+
+        ── RAW IDENTIFIER ───────────────────────────────────────────────────────
+        - 'Muscle_Name'   : Original OpenSim muscle identifier (e.g. 'MF_m3s_r').
+          Do NOT filter on this directly — use the clean columns below instead.
+
+        ── ENRICHMENT COLUMNS (use these for all queries) ────────────────────────
+        - 'full_name'         : Human-readable anatomical name (e.g. 'Lumbar Multifidus').
+        - 'muscle_group'      : Broad functional group. Values include:
+              'Back Extensor', 'Hip Flexor / Lumbar', 'Abdominal',
+              'Lateral Trunk', 'Shoulder', 'Rotator Cuff', 'Chest',
+              'Neck', 'Thoracic', 'Back / Shoulder', 'Unknown'.
+        - 'functional_region' : Body region. Values include:
+              'Lumbar', 'Thoracic', 'Cervical', 'Trunk',
+              'Shoulder', 'Thoracolumbar / Shoulder', 'Shoulder / Chest',
+              'Cervical / Shoulder', 'Thoracic / Shoulder'.
+        - 'side'              : 'Left', 'Right', or 'Bilateral'.
+              If user does not specify a side, query BOTH or use mean across sides.
+        - 'spinal_level'      : Comma-separated vertebral levels encoded in the name
+              (e.g. 'L3, L4', 'T6', 'C4'). Empty string if none.
+        - 'primary_actions'   : Comma-separated functional roles
+              (e.g. 'Spinal Extension, Lateral Flexion').
+        - 'origin'            : Anatomical origin of the muscle.
+        - 'insertion'         : Anatomical insertion of the muscle.
+
+        ── DEMOGRAPHICS ─────────────────────────────────────────────────────────
+        - 'Model'      : OpenSim model filename.
+        - 'Activity'   : The performed activity name.
+        - 'Age'        : Subject age (years).
+        - 'Weight_kg'  : Subject body weight (kg).
+        - 'Height_m'   : Subject height (m).
+
+        ── DATA VALUE ───────────────────────────────────────────────────────────
+        - 'Value'      : The numeric result.
+              For FORCES     → Newtons (N).
+              For ACTIVATIONS → 0.0 – 1.0 (normalised effort).
+
+        ── QUERY PATTERNS (use these instead of raw Muscle_Name filtering) ──────
+        # All lumbar extensors:
+        df[df['functional_region'] == 'Lumbar']
+        # Psoas only:
+        df[df['full_name'] == 'Psoas Major']
+        # Back extensors (all regions):
+        df[df['muscle_group'] == 'Back Extensor']
+        # Right-side abdominals:
+        df[(df['muscle_group'] == 'Abdominal') & (df['side'] == 'Right')]
+        # Muscles acting at L4 or L5:
+        df[df['spinal_level'].str.contains('L4|L5', na=False)]
+        # Muscles whose primary action includes Extension:
+        df[df['primary_actions'].str.contains('Extension', case=False, na=False)]
+
+        ── LEGACY PREFIX REFERENCE (for recognising raw names only) ─────────────
+        Ps_   → Psoas Major          | IL_     → Iliocostalis
+        LTpL_ → Longissimus Lumborum | LTpT_   → Longissimus Thoracis
+        MF_   → Lumbar Multifidus    | QL_     → Quadratus Lumborum
+        rect_abd → Rectus Abdominis  | IO*     → Internal Oblique
+        E0_   → External Oblique     | TR_     → Transversus Abdominis
+        LD_   → Latissimus Dorsi     | DELT1/2/3 → Deltoid heads
     """
+
 
     # Global Rules for all agents (Anti-Hallucination & Conciseness)
     global_rules = """
     CRITICAL EXECUTION RULES:
-    1. **NO RAW CODE**: You are an analyst. DO NOT output python code blocks in the final answer. Execute the code silently.
-    2. **CONCISENESS**: Keep text results SHORT, DIRECT, and NON-VERBOSE. Avoid filler words.
-    3. **DATA AVAILABILITY**: The dataframe is ALREADY loaded in your environment as the variable `df`. 
-       - DO NOT say "I don't have access".
-       - DO NOT ask the user for data.
-       - JUST USE `df`.
+    1. **NO RAW CODE**: DO NOT output python code blocks in the final answer. Execute ALL code silently.
+    2. **CONCISENESS**: Keep text results SHORT, DIRECT, and NON-VERBOSE.
+    3. **DATA AVAILABILITY**: The dataframe is ALREADY loaded as `df`. JUST USE `df`.
     4. Write python code to answer the question.
-    
-    PLOTTING PROTOCOL (Strict):
-    - ONLY plot if specifically instructed by the prompt.
-    - If plotting:
-      ```python
-      import matplotlib.pyplot as plt
-      plt.switch_backend('Agg')
-      plt.close('all')
-      plt.figure(figsize=(10, 6))
-      # ... plot code ...
-      plt.savefig('static/generated_plot.png', bbox_inches='tight')
-      ```
-    - DO NOT use `plt.show()`.
+    5. **STATISTICAL ANALYSIS**: Use `numpy` first, then `scipy`, then `statsmodels`. Do NOT hand-roll math formulas.
+
+    PLOTTING PROTOCOL (Mandatory — follow exactly or do NOT claim a plot was made):
+    - ONLY plot if the instruction explicitly says to plot.
+    - If plotting is requested, you MUST execute ALL of the following code exactly:
+      Step 1 — Set up backend and directory:
+        import os, matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        os.makedirs('static', exist_ok=True)
+        plt.close('all')
+      Step 2 — Create the figure and draw the plot.
+      Step 3 — Save and verify:
+        plt.savefig('static/generated_plot.png', bbox_inches='tight', dpi=150)
+        plt.close('all')
+        assert os.path.exists('static/generated_plot.png'), 'Plot was NOT saved!'
+    - NEVER call plt.show().
+    - NEVER say 'Plot saved' unless the assert above passed without error.
+    - If ANY step fails, report the error in your final answer instead of claiming success.
     """
 
     selected_df = None
@@ -1302,10 +1215,20 @@ def analysis_agent_node(state):
         You are the SPINAL LOAD SPECIALIST.
         {global_rules}
         
-        DOMAIN KNOWLEDGE (SPINAL):
-        - `Load_Name`: [Joint]_[Direction]
-        - COMPRESSION (Vertical): Suffix `_fy`.
-        - SHEAR (Horizontal): Suffixes `_fx` or `_fz`.
+        DOMAIN KNOWLEDGE (SPINAL — wide format, IVDjnt joints only):
+        - The dataframe has already been pre-processed. Each row represents ONE spinal joint for ONE simulation.
+        - COLUMNS:
+            * 'Model'      : OpenSim model filename.
+            * 'Activity'   : The performed activity (e.g. 'Neutral standing').
+            * 'Age', 'Weight_kg', 'Height_m': Subject demographics.
+            * 'Joint'      : Spinal joint label (e.g. 'L5_S1', 'L4_L5', 'T1_T2', etc.).
+            * 'force_fx'   : Anterior-posterior shear force [Newtons].
+            * 'force_fy'   : Compression force (vertical) [Newtons].
+            * 'force_fz'   : Medial-lateral shear force [Newtons].
+        - Only IVD (intervertebral disc) joint loads are included.
+        - COMPRESSION: use column `force_fy`.
+        - SHEAR: use columns `force_fx` and/or `force_fz`.
+        - To filter a specific joint: `df[df['Joint'] == 'L5_S1']`.
         - UNITS: Newtons.
         """
 
@@ -1352,6 +1275,9 @@ def analysis_agent_node(state):
             handle_parsing_errors=True,
             prefix=system_prefix
         )
+
+        # Ensure static/ directory exists so plt.savefig never fails silently
+        os.makedirs('static', exist_ok=True)
 
         # Force input context regarding df existence
         final_prompt = f"{instruction} (Recall: The dataframe `df` is already loaded. Use it.)"
