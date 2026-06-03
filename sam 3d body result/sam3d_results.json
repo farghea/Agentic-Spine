@@ -1,15 +1,15 @@
 {
   "individual_keypoints": [
-    "https://segmind-inference-io.s3.amazonaws.com/sam3d-body/f862b556f569a9f57ddf4a3676e99192/person_0_keypoints.json"
+    "https://segmind-inference-io.s3.amazonaws.com/sam3d-body/7718c4b6a251ce0715ffeed17fe72e9c/person_0_keypoints.json"
   ],
-  "inference_time": 0.6694924831390381,
-  "keypoints": "https://segmind-inference-io.s3.amazonaws.com/sam3d-body/f862b556f569a9f57ddf4a3676e99192/keypoints.json",
-  "keypoints_3d": "https://segmind-inference-io.s3.amazonaws.com/sam3d-body/f862b556f569a9f57ddf4a3676e99192/keypoints_3d.json",
+  "inference_time": 0.7299563884735107,
+  "keypoints": "https://segmind-inference-io.s3.amazonaws.com/sam3d-body/7718c4b6a251ce0715ffeed17fe72e9c/keypoints.json",
+  "keypoints_3d": "https://segmind-inference-io.s3.amazonaws.com/sam3d-body/7718c4b6a251ce0715ffeed17fe72e9c/keypoints_3d.json",
   "metadata": {
     "meshes": [
       {
         "faces_count": 36874,
-        "mesh_ply": "https://segmind-inference-io.s3.amazonaws.com/sam3d-body/f862b556f569a9f57ddf4a3676e99192/person_0.ply",
+        "mesh_ply": "https://segmind-inference-io.s3.amazonaws.com/sam3d-body/7718c4b6a251ce0715ffeed17fe72e9c/person_0.ply",
         "person_id": 0,
         "vertices_count": 18439
       }
@@ -18,17 +18,17 @@
     "people": [
       {
         "camera_translation": [
-          0.01126527413725853,
-          1.062068223953247,
-          3.328521490097046
+          0.43030303716659546,
+          1.094407320022583,
+          2.520346164703369
         ],
-        "focal_length": 1353.2318115234375,
+        "focal_length": 1559.213623046875,
         "keypoints_2d_count": 70,
         "keypoints_3d_count": 70,
         "person_id": 0
       }
     ]
   },
-  "model_glb": "https://segmind-inference-io.s3.amazonaws.com/sam3d-body/f862b556f569a9f57ddf4a3676e99192/output.glb",
+  "model_glb": "https://segmind-inference-io.s3.amazonaws.com/sam3d-body/7718c4b6a251ce0715ffeed17fe72e9c/output.glb",
   "status": "Success"
 }

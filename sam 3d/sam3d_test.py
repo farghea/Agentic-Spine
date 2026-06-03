@@ -178,7 +178,5 @@ def plot_keypoints_3d_matplotlib(json_path):
 
 if __name__ == "__main__":
     # sam3d_call("lift_test.jpg") 
-
-    plot_keypoints_3d_matplotlib("sam 3d body result/keypoints_3d.json")
-    
-    
+    # plot_keypoints_3d_matplotlib("sam 3d body result/keypoints_3d.json")
+    pass

@@ -1289,4 +1289,188 @@ def analysis_agent_node(state):
 
     except Exception as e:
         return {"final_message": f"Agent Execution Error: {e}"}
-    
+
+
+# =============================================================================
+# IMAGE-UPLOAD PIPELINE NODES
+# =============================================================================
+
+import base64 as _base64
+import sys as _sys
+import os as _os
+
+def _load_keys():
+    with open("info_and_keys.json") as f:
+        return json.load(f)
+
+
+def _b64_image(image_path: str) -> tuple:
+    """Return (base64_string, mime_type) for an image file."""
+    ext = _os.path.splitext(image_path)[-1].lower().lstrip(".")
+    mime = {
+        "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "png": "image/png",  "tiff": "image/tiff",
+        "bmp": "image/bmp",  "webp": "image/webp",
+    }.get(ext, "image/jpeg")
+    with open(image_path, "rb") as f:
+        return _base64.b64encode(f.read()).decode("utf-8"), mime
+
+
+# ── Node A: Input Router ──────────────────────────────────────────────────────
+def input_router_node(state):
+    """
+    Entry-point node.  Checks if an image was uploaded and signals which
+    branch to take.  Returns the state unchanged — routing is handled by
+    the conditional edge in main.py.
+    """
+    if state.get("uploaded_image_path"):
+        print("--- Input Router: image detected → image pipeline ---")
+        return {"current_status": "Image detected. Classifying…"}
+    else:
+        print("--- Input Router: text-only → OpenSim pipeline ---")
+        return {"current_status": "Text-only prompt. Running OpenSim pipeline…"}
+
+
+# ── Node B: Image Classifier ──────────────────────────────────────────────────
+def image_classifier_node(state):
+    """
+    Sends the uploaded image to OpenAI Vision and classifies it as either
+    'medical' (CT / MRI / X-ray of the spine) or 'lifting' (person lifting
+    / handling an object).
+    Stores result in state['image_type'].
+    """
+    print("--- Image Classifier: calling OpenAI Vision ---")
+    image_path = state["uploaded_image_path"]
+
+    try:
+        keys   = _load_keys()
+        client = OpenAI(api_key=keys["openai_api_key"])
+        b64, mime = _b64_image(image_path)
+
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Classify this image into exactly ONE of two categories:\n"
+                            "1. 'medical'  — if it is a medical scan (CT, MRI, X-ray, or similar clinical imaging).\n"
+                            "2. 'lifting'  — if it shows a person lifting, carrying, or physically handling an object.\n"
+                            "Reply with ONLY the single word: medical  OR  lifting"
+                        ),
+                    },
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                ],
+            }],
+            max_tokens=5,
+        )
+        label = response.choices[0].message.content.strip().lower()
+        image_type = "medical" if "medical" in label else "lifting"
+        print(f"   -> Classified as: {image_type}")
+        return {"image_type": image_type,
+                "current_status": f"Image classified as '{image_type}'."}
+
+    except Exception as e:
+        print(f"   -> Classification error (defaulting to 'lifting'): {e}")
+        return {"image_type": "lifting",
+                "current_status": f"Classification error — treating as lifting: {e}"}
+
+
+# ── Node C: Medical Placeholder ───────────────────────────────────────────────
+def medical_placeholder_node(state):
+    """Stub for the medical-image pathway (to be implemented later)."""
+    print("--- Medical Placeholder Node ---")
+    return {
+        "final_message": (
+            "🩺 **Medical image detected.**\n\n"
+            "The medical-imaging analysis pathway (CT / MRI / X-ray spine assessment) "
+            "is under development and will be available in a future release."
+        ),
+        "current_status": "Medical image path — placeholder.",
+    }
+
+
+# ── Node D: SAM-3D Processor ──────────────────────────────────────────────────
+def sam3d_node(state):
+    """
+    Calls sam3d_call(image_path) from sam 3d/sam3d_test.py to obtain 3-D
+    keypoints and saves them to 'sam 3d body result/keypoints_3d.json'.
+    """
+    print("--- SAM-3D Node: calling SAM-3D API ---")
+    image_path = state["uploaded_image_path"]
+
+    sam3d_dir = _os.path.join(_os.getcwd(), "sam 3d")
+    if sam3d_dir not in _sys.path:
+        _sys.path.insert(0, sam3d_dir)
+
+    try:
+        from sam3d_test import sam3d_call
+        sam3d_call(image_path)
+        return {"current_status": "SAM-3D keypoints computed successfully."}
+    except Exception as e:
+        return {
+            "final_message": f"SAM-3D Error: {e}",
+            "current_status": f"SAM-3D failed: {e}",
+        }
+
+
+# ── Node E: Lifting Analysis ──────────────────────────────────────────────────
+def lifting_analysis_node(state):
+    """
+    Reads SAM-3D keypoints, computes pose metrics (F, A, D), estimates the
+    handled-object weight (M) via Vision, runs the spinal load model, and
+    stores all results in state['image_analysis_result'].
+    """
+    print("--- Lifting Analysis Node ---")
+    image_path = state["uploaded_image_path"]
+    prompt     = state.get("user_prompt", "")
+
+    sam3d_dir = _os.path.join(_os.getcwd(), "sam 3d")
+    if sam3d_dir not in _sys.path:
+        _sys.path.insert(0, sam3d_dir)
+
+    try:
+        keys = _load_keys()
+        from lifting_analysis_utils import run_full_lifting_analysis
+
+        result = run_full_lifting_analysis(image_path, prompt, keys["openai_api_key"])
+
+        if result.get("error"):
+            return {
+                "final_message": f"Lifting analysis error: {result['error']}",
+                "current_status": "Lifting analysis failed.",
+            }
+
+        # Build a human-readable summary for the final_message
+        loads  = result["spinal_loads"]
+        summary = (
+            f"**Lifting Analysis Complete**\n\n"
+            f"**Body params used:** Height = {result['BH']} cm, Weight = {result['BW']} kg\n"
+            f"**Object weight (M):** {result['M']} kg\n\n"
+            f"**Pose Metrics**\n"
+            f"- Flexion (F): {result['flexion_deg']}°\n"
+            f"- Asymmetry (A): {result['asymmetry_deg']}°\n"
+            f"- Reach (D): {result['reach_cm']} cm\n\n"
+            f"**Spinal Loads** *(model: {result['model_used']})*\n"
+            f"- L4-L5 Compression: {loads.get('L4L5_compression', 'N/A')} N\n"
+            f"- L4-L5 Shear: {loads.get('L4L5_shear', 'N/A')} N\n"
+            f"- L5-S1 Compression: {loads.get('L5S1_compression', 'N/A')} N\n"
+            f"- L5-S1 Shear: {loads.get('L5S1_shear', 'N/A')} N\n"
+        )
+
+        return {
+            "image_analysis_result": result,
+            "final_message": summary,
+            "current_status": "Lifting analysis complete.",
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "final_message": f"Lifting analysis exception: {e}",
+            "current_status": "Lifting analysis failed.",
+        }
