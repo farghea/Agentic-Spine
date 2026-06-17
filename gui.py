@@ -8,7 +8,7 @@ from main import app
 from utils import analysis_agent_node
 
 st.set_page_config(page_title="Biomechanics AI Agent", layout="wide")
-st.title("🦴 Biomechanics Agent")
+st.title("🦴 Spine Biomechanics Agent")
 
 PLOT_PATH = "static/generated_plot.png"
 
