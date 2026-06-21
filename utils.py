@@ -150,6 +150,13 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_experimental.agents import create_pandas_dataframe_agent
 from preprocessing.muscle_enrichment import filter_and_enrich
 
+# --- Interpolation generators ---
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'opensim_files', 'motion force interpolation'))
+from interpolate_mot import generate_interpolated_mot
+from generate_force_mot import generate_force_mot
+
+INTERPOL_DIR = os.path.join(os.path.dirname(__file__), 'opensim_files', 'motion force interpolation')
+
 # MODEL = 'gemini'
 # MODEL_TYPE = 'gemini-2.5-flash-lite'
 # MODEL_TYPE = 'gemini-2.5-flash'
@@ -169,13 +176,21 @@ def run_opensim_simulation(
     os.chdir(os.path.join(cwd, 'opensim_files'))
 
     model_file  = os.path.abspath(model_path)
-    motion_file = os.path.abspath(
-        os.path.join('StaticActivities_126', 'Motions 126', motion_path)
-    )
 
-    forces_file = os.path.abspath(
-        os.path.join('StaticActivities_126', 'External Forces 126', external_force_path)
-    )
+    # Support absolute paths (e.g. interpolated files) or relative paths (standard DB files)
+    if os.path.isabs(motion_path):
+        motion_file = motion_path
+    else:
+        motion_file = os.path.abspath(
+            os.path.join('StaticActivities_126', 'Motions 126', motion_path)
+        )
+
+    if os.path.isabs(external_force_path):
+        forces_file = external_force_path
+    else:
+        forces_file = os.path.abspath(
+            os.path.join('StaticActivities_126', 'External Forces 126', external_force_path)
+        )
 
     # 2. Build the command as a SINGLE STRING
     # We wrap paths in quotes "{variable}" to handle spaces safely
@@ -256,16 +271,19 @@ def analyze_request_node(state):
 
     ### TASK 1: Subject Filter
     - Extract constraints for Sex, Age, Weight, Height.
-    - Output standardized ranges [min, max]. 
-    - If "single subject", min and max are equal. 
+    - Output standardized ranges [min, max].
+    - If "single subject", min and max are equal.
     - If "batch/group", use the range defined (use -1 if undefined).
 
-    ### TASK 2: Activity Matching
-    - Identify ALL activities requested by the user.
-    - Match them exactly to strings in this list: {list(activity_dictionary.keys())}
-    - If the user implies a category (e.g., "all lifting"), select all relevant keys.
+    ### TASK 2: Activity List
+    - Identify ALL physical activities / postures the user wants to simulate.
+    - Write each one as a short, clear plain-text description that preserves the EXACT
+      angle and load the user mentioned (e.g. "50 degree trunk flexion",
+      "30 degree trunk flexion with 10 kg in each hand", "push cart").
+    - Do NOT round, approximate, or map to any predefined list.
+      Keep the exact numbers the user gave.
 
-    ### Height should be in meter and weight in kilogram, so convert if needed. 
+    ### Height should be in meters and weight in kilograms, so convert if needed.
 
     ### OUTPUT JSON ONLY:
     {{
@@ -276,7 +294,7 @@ def analyze_request_node(state):
           "weight_range": [min, max],
           "height_range": [min, max]
       }},
-      "activity_keys": ["Activity Name 1", "Activity Name 2"],
+      "raw_activities": ["50 degree trunk flexion", "push cart"],
       "verification": "Simulating [User's Subject] performing [Activity Count] tasks..."
     }}
     """
@@ -317,6 +335,118 @@ def analyze_request_node(state):
         print(f"API Error ({MODEL}): {e}")
         return {"analysis_result": {"is_relevant": False}, "final_message": f"AI Error: {e}"}
 
+
+
+
+def activity_router_node(state):
+    """
+    Node 1b: Classifies each raw activity from analyze_request_node.
+
+    Rules (applied by the LLM):
+    - Trunk flexion (any angle):  is_flexion=True, extract exact angle and
+      weight_per_hand_kg.  No dictionary lookup.
+    - Everything else:            is_flexion=False, find the single closest
+      matching key from activity_dictionary.
+
+    Writes 'routed_activities' into state — a list of dicts, one per activity.
+    """
+    print("--- Node 1b: Routing Activities ---")
+
+    raw_activities = state.get('analysis_result', {}).get('raw_activities', [])
+    if not raw_activities:
+        print("   No raw activities found. Skipping routing.")
+        return {"routed_activities": []}
+
+    try:
+        with open('info_and_keys.json') as f:
+            keys = json.load(f)
+    except Exception as e:
+        return {"final_message": f"Config Error: {e}"}
+
+    dict_keys = list(activity_dictionary.keys())
+
+    prompt = f"""
+You are a biomechanics expert. Classify each activity below and output a JSON array.
+
+Activities to classify:
+{json.dumps(raw_activities, indent=2)}
+
+Rules:
+1. If the activity is a TRUNK FLEXION (forward bending of the torso at any angle):
+   - Set "is_flexion": true
+   - Set "angle": the exact integer angle in degrees the user specified.
+   - Set "weight_per_hand_kg":
+       * "X kg in each hand"  →  weight_per_hand_kg = X
+       * "X kg in hands" (total) → weight_per_hand_kg = X / 2
+       * no load mentioned  →  weight_per_hand_kg = 0.0
+   - Set "dict_match": null
+
+2. If the activity is NOT a trunk flexion:
+   - Set "is_flexion": false
+   - Set "angle": null
+   - Set "weight_per_hand_kg": null
+   - Set "dict_match": the single CLOSEST matching string from this list:
+     {json.dumps(dict_keys)}
+
+OUTPUT: a JSON array only, no extra text.
+Example:
+[
+  {{
+    "label": "50 degree trunk flexion",
+    "is_flexion": true,
+    "angle": 50,
+    "weight_per_hand_kg": 0.0,
+    "dict_match": null
+  }},
+  {{
+    "label": "push cart",
+    "is_flexion": false,
+    "angle": null,
+    "weight_per_hand_kg": null,
+    "dict_match": "Push shopping cart"
+  }}
+]
+"""
+
+    try:
+        content = ""
+
+        if MODEL == 'openai':
+            client = OpenAI(api_key=keys['openai_api_key'])
+            response = client.chat.completions.create(
+                model=MODEL_TYPE,
+                messages=[
+                    {"role": "system", "content": "You are a data extraction assistant. Output strictly valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+            )
+            content = response.choices[0].message.content.strip()
+            # Strip markdown fences if present
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+
+        elif MODEL == 'gemini':
+            genai.configure(api_key=keys['gemini_api_key'])
+            model = genai.GenerativeModel(MODEL_TYPE)
+            response = model.generate_content(prompt)
+            content = response.text.replace('```json', '').replace('```', '').strip()
+
+        else:
+            return {"final_message": f"Error: Unknown MODEL '{MODEL}'"}
+
+        routed = json.loads(content)
+        print(f"   Routed {len(routed)} activities:")
+        for a in routed:
+            if a.get('is_flexion'):
+                print(f"     [FLEXION] {a['label']} | angle={a['angle']}° | load/hand={a['weight_per_hand_kg']} kg")
+            else:
+                print(f"     [STANDARD] {a['label']} → '{a['dict_match']}'")
+
+        return {"routed_activities": routed}
+
+    except Exception as e:
+        print(f"   Router Error: {e}")
+        return {"routed_activities": [], "final_message": f"Activity Router Error: {e}"}
 
 
 
@@ -797,94 +927,124 @@ OUTPUT FORMAT:
 
 def simulation_node(state):
     """
-    Node 3: The 'Action'. Loops through selected Models and Activities 
+    Node 3: The 'Action'. Loops through selected Models and Activities
     to run OpenSim simulations for every combination.
     """
     print("--- Node 3: Running Simulations ---")
-    
-    # 1. Retrieve Inputs from State
-    models = state.get('selected_models', [])
-    activity_names = state['analysis_result'].get('activity_keys', [])
-    
-    # 2. Load Activity ID Dictionary (from your json file)
-    activity_map = activity_dictionary
+
+    # ── 0. Cleanup: delete previously generated .mot files in INTERPOL_DIR ──────
+    print(f"   Cleaning up old interpolated .mot files in: {INTERPOL_DIR}")
+    for fname in os.listdir(INTERPOL_DIR):
+        if fname.endswith('.mot'):
+            fpath = os.path.join(INTERPOL_DIR, fname)
+            if os.path.isfile(fpath):          # skip subdirectories
+                os.remove(fpath)
+                print(f"   Deleted: {fname}")
+
+    # ── 1. Retrieve Inputs from State ────────────────────────────────────────────
+    models           = state.get('selected_models', [])
+    routed_activities = state.get('routed_activities', [])
+
+    if not routed_activities:
+        return {"simulation_output": [], "final_message": "No activities to simulate.",
+                "current_status": "Simulation skipped — no routed activities."}
 
     results_log = []
 
-    # 3. Double Loop: Iterate over every Person AND every Activity
+    # ── 2. Double Loop: every Model × every Activity ───────────────────────────
     for model_info in models:
-        for act_name in activity_names:
-            
-            # Get the numeric ID (e.g., 'Neutral standing' -> 2)
-            act_id = activity_map.get(act_name)
-            
-            if act_id is None:
-                print(f"Warning: No ID found for '{act_name}'. Skipping.")
-                continue
+        for act in routed_activities:
 
-            # 4. Define Paths
-            # (Node 2 already created 'full_path', but we handle fallback just in case)
+            label      = act.get('label', 'unknown')
+            is_flexion = act.get('is_flexion', False)
+
+            # ── 3. Resolve model path ─────────────────────────────────────────
             model_path = model_info.get('full_path')
             if not model_path:
-                # Reconstruct if missing
-                model_path = os.path.join(os.getcwd(), 'opensim_files', 
-                                          model_info['Directory'], 
-                                          model_info['Filename'])
+                model_path = os.path.join(
+                    os.getcwd(), 'opensim_files',
+                    model_info['Directory'], model_info['Filename']
+                )
 
-            # Define Motion/Force paths based on ID
-            # assuming these are in a fixed 'inputs' folder or similar
-            motion_path = f"NMB_Motion{act_id}.mot" 
-            force_path  = f"NMB_ExternalForce{act_id}.mot"
-            
-            
-            print(f"-> Running: {act_name} (ID: {act_id}) on {model_info['Filename']}...")
+            # ── 4. Resolve motion & force paths ─────────────────────────────────
+            if is_flexion:
+                angle           = int(act.get('angle') or 0)
+                weight_per_hand = float(act.get('weight_per_hand_kg') or 0.0)
+                load_n          = weight_per_hand * -9.81
 
-            # 5. Run the Simulation (Mocked Placeholder)
+                print(f"   [FLEXION] {label} | angle={angle}° | load/hand={weight_per_hand} kg ({load_n:.2f} N)")
+
+                # Generate interpolated motion file at exact angle
+                motion_files = generate_interpolated_mot(
+                    flexion_angles=[angle],
+                    output_dir=INTERPOL_DIR,
+                )
+                motion_path = motion_files[0]   # absolute path
+
+                # Generate external force file with exact load
+                force_files = generate_force_mot(
+                    load_n=load_n,
+                    output_dir=INTERPOL_DIR,
+                )
+                force_path = force_files[0]     # absolute path
+
+                act_label_for_log = f"{label} (interpolated {angle}°)"
+
+            else:
+                dict_match = act.get('dict_match', '')
+                act_id     = activity_dictionary.get(dict_match)
+
+                if act_id is None:
+                    print(f"   Warning: No ID found for '{dict_match}'. Skipping '{label}'.")
+                    continue
+
+                # Standard DB files (resolved inside run_opensim_simulation)
+                motion_path = f"NMB_Motion{act_id}.mot"
+                force_path  = f"NMB_ExternalForce{act_id}.mot"
+                act_label_for_log = f"{label} (matched: '{dict_match}', ID: {act_id})"
+
+            print(f"-> Running: {act_label_for_log} on {model_info['Filename']}...")
+
+            # ── 5. Run Simulation ───────────────────────────────────────────────────
             try:
-                # ---------------------------------------------------------
-                # REAL CALL GOES HERE:
                 spinal_loads, muscle_forces, muscle_activations = run_opensim_simulation(
-                    model_path, 
-                    motion_path, 
-                    force_path)
+                    model_path,
+                    motion_path,
+                    force_path,
+                )
 
-                
-                # ---------------------------------------------------------
-                
-                # Mocking success
                 results_log.append({
-                    "model": model_info['Filename'],
-                    "activity": act_name,
-                    "status": "Success",
-                    "id_used": act_id,
+                    "model":    model_info['Filename'],
+                    "activity": label,
+                    "status":   "Success",
                     "results": {
-                        "spinal_loads": spinal_loads,
-                        "muscle_forces": muscle_forces,
-                        "muscle_activations": muscle_activations
+                        "spinal_loads":       spinal_loads,
+                        "muscle_forces":      muscle_forces,
+                        "muscle_activations": muscle_activations,
                     }
                 })
-                
+
             except Exception as e:
                 results_log.append({
-                    "model": model_info['Filename'],
-                    "activity": act_name,
-                    "status": f"Failed: {e}",
-                    "results": None
+                    "model":    model_info['Filename'],
+                    "activity": label,
+                    "status":   f"Failed: {e}",
+                    "results":  None,
                 })
 
-    # 6. Final Summary
-    total_runs = len(results_log)
+    # ── 7. Final Summary ───────────────────────────────────────────────────────
+    total_runs    = len(results_log)
     success_count = sum(1 for r in results_log if r['status'] == "Success")
-    
+
     summary_msg = (
         f"Completed {success_count}/{total_runs} simulations.\n"
-        f"Models: {len(models)} | Activities: {len(activity_names)}"
+        f"Models: {len(models)} | Activities: {len(routed_activities)}"
     )
-    
+
     return {
-        "simulation_output": results_log, 
-        "final_message": summary_msg,
-        "current_status": f"Simulation Finished. {summary_msg}"
+        "simulation_output": results_log,
+        "final_message":     summary_msg,
+        "current_status":    f"Simulation Finished. {summary_msg}"
     }
 
 

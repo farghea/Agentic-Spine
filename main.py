@@ -10,6 +10,7 @@ from langgraph.graph import StateGraph, END
 # --- Import Nodes from utils ---
 from utils import (
     analyze_request_node,
+    activity_router_node,
     model_selection_node,
     simulation_node,
     data_processing_node,
@@ -31,6 +32,7 @@ class AgentState(TypedDict):
 
     # ── text-only / OpenSim path ─────────────────────────────
     analysis_result:       Optional[dict]
+    routed_activities:     Optional[List[dict]]
     selected_models:       Optional[List[dict]]
     simulation_output:     Optional[List[dict]]
     dataframes:            Optional[dict]
@@ -84,11 +86,12 @@ workflow.add_node("medical_placeholder", medical_placeholder_node)
 workflow.add_node("sam3d_processor",     sam3d_node)
 workflow.add_node("lifting_analyzer",    lifting_analysis_node)
 
-workflow.add_node("analyzer",       analyze_request_node)
-workflow.add_node("model_selector", model_selection_node)
-workflow.add_node("simulator",      simulation_node)
-workflow.add_node("processor",      data_processing_node)
-workflow.add_node("analyst",        analysis_agent_node)
+workflow.add_node("analyzer",         analyze_request_node)
+workflow.add_node("activity_router",  activity_router_node)
+workflow.add_node("model_selector",   model_selection_node)
+workflow.add_node("simulator",        simulation_node)
+workflow.add_node("processor",        data_processing_node)
+workflow.add_node("analyst",          analysis_agent_node)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 workflow.set_entry_point("input_router")
@@ -112,8 +115,9 @@ workflow.add_edge("lifting_analyzer",    END)
 workflow.add_conditional_edges(
     "analyzer",
     route_request,
-    {"model_selector": "model_selector", "end": END},
+    {"model_selector": "activity_router", "end": END},
 )
+workflow.add_edge("activity_router", "model_selector")
 workflow.add_conditional_edges(
     "model_selector",
     route_model_selection,
