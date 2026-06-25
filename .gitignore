@@ -3,3 +3,14 @@
 
 # Ignore specific sensitive credential file
 info_and_keys.json
+
+# Ignore image and medical imaging file formats
+*.nii.gz
+*.mha
+*.png
+*.jpg
+
+# Ignore generated results, static assets, and temporary simulation files
+results_medical_image_segmentation/
+static/
+opensim_files/motion force interpolation/

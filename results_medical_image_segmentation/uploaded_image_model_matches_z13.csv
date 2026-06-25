@@ -1,6 +1,0 @@
-rank,distance_deg,n_shared_levels,orientation,sex,age_group,lumbar_lordosis_deg,thoracic_kyphosis_deg,model_file,shared_levels
-1,2.6155,3,original,Male,Age80plus,53.2093,37.4521,122_SizeScaled_CurvatureAdjust_MuscleAdjust.osim,L1-L2|L2-L3|L3-L4
-2,3.0675,3,original,Male,Age80plus,54.8878,35.9525,383_SizeScaled_CurvatureAdjust_MuscleAdjust.osim,L1-L2|L2-L3|L3-L4
-3,3.1138,3,original,Female,Age4049,52.4548,45.0191,572_SizeScaled_CurvatureAdjust_MuscleAdjust.osim,L1-L2|L2-L3|L3-L4
-4,3.2334,3,original,Male,Age80plus,54.7156,55.1223,553_SizeScaled_CurvatureAdjust_MuscleAdjust.osim,L1-L2|L2-L3|L3-L4
-5,3.3718,3,original,Female,Age5059,53.3601,54.2749,473_SizeScaled_CurvatureAdjust_MuscleAdjust.osim,L1-L2|L2-L3|L3-L4
