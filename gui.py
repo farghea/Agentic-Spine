@@ -2,7 +2,6 @@
 import streamlit as st
 import pandas as pd
 import os
-import tempfile
 
 from main import app
 from utils import analysis_agent_node
@@ -13,36 +12,44 @@ st.title("🦴 Spine Biomechanics Agent")
 PLOT_PATH = "static/generated_plot.png"
 
 # --- SESSION STATE ---
-if "chat_history"           not in st.session_state:
+if "chat_history"          not in st.session_state:
     st.session_state.chat_history = []
-if "dataframes"             not in st.session_state:
+if "dataframes"            not in st.session_state:
     st.session_state.dataframes = None
-if "simulation_done"        not in st.session_state:
+if "simulation_done"       not in st.session_state:
     st.session_state.simulation_done = False
-if "image_analysis_result"  not in st.session_state:
+if "image_analysis_result" not in st.session_state:
     st.session_state.image_analysis_result = None
-if "image_analysis_done"    not in st.session_state:
+if "image_analysis_done"   not in st.session_state:
     st.session_state.image_analysis_done = False
+if "mri_result"            not in st.session_state:
+    st.session_state.mri_result = None   # dict: plot_path, best_match, all_matches
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 1: INPUT  (simulation not yet done and image analysis not yet done)
+# SECTION 1: INPUT  (nothing done yet)
 # ══════════════════════════════════════════════════════════════════════════════
-if not st.session_state.simulation_done and not st.session_state.image_analysis_done:
-
+if not (
+    st.session_state.simulation_done
+    or st.session_state.image_analysis_done
+    or st.session_state.mri_result
+):
     st.subheader("Enter your prompt:")
 
-    # ── Image upload ──────────────────────────────────────────────────────────
+    # ── File upload — accepts .mha AND regular images ─────────────────────────
     uploaded_file = st.file_uploader(
-        "Upload an image (optional — lifting scene or medical scan)",
-        type=["jpg", "jpeg", "png", "tiff", "bmp", "webp"],
-        help="If you upload an image it will be analysed by the AI. "
-             "No image → the OpenSim simulation pipeline is used.",
+        "Upload a file (optional)",
+        type=["mha", "jpg", "jpeg", "png", "tiff", "bmp", "webp"],
+        help=(
+            "**.mha** → MRI spine scan: full segmentation + model matching + OpenSim simulation\n\n"
+            "**image** (jpg/png/…) → lifting scene: SAM-3D pose + spinal load analysis\n\n"
+            "No file → text-only OpenSim simulation"
+        ),
     )
 
     # ── Text prompt ───────────────────────────────────────────────────────────
     user_query = st.text_area(
-        "Describe the task (or add body height / weight hints for image analysis):",
+        "Describe the task (body height / weight hints, or activity to simulate):",
         "Simulate standing upright for a 72 kg man with height of 170 cm. "
         "Analyze the compression forces on L5_S1.",
     )
@@ -50,15 +57,15 @@ if not st.session_state.simulation_done and not st.session_state.image_analysis_
     if st.button("Submit"):
         with st.status("Agent working...", expanded=True) as status:
             try:
-                # ── Save uploaded image to a temp file ────────────────────────
+                # ── Save uploaded file ────────────────────────────────────────
                 image_path = None
                 if uploaded_file is not None:
-                    suffix = os.path.splitext(uploaded_file.name)[-1]
+                    suffix = os.path.splitext(uploaded_file.name)[-1]  # e.g. .mha  .jpg
                     os.makedirs("static", exist_ok=True)
                     image_path = os.path.join("static", f"uploaded_image{suffix}")
                     with open(image_path, "wb") as f:
                         f.write(uploaded_file.getbuffer())
-                    status.write(f"📁 Image saved: `{image_path}`")
+                    status.write(f"📁 File saved: `{image_path}`")
 
                 # ── Stream graph ──────────────────────────────────────────────
                 final_state = {}
@@ -77,10 +84,22 @@ if not st.session_state.simulation_done and not st.session_state.image_analysis_
 
                 status.update(label="Done!", state="complete", expanded=False)
 
-                # ── Route result to the correct post-processing branch ────────
+                # ── Route result ──────────────────────────────────────────────
 
-                # A) Image analysis result
-                if final_state.get("image_analysis_result"):
+                # A) MRI pipeline — segmentation + model match + simulation
+                if final_state.get("mri_result"):
+                    st.session_state.mri_result      = final_state["mri_result"]
+                    st.session_state.simulation_done = True
+                    if final_state.get("dataframes"):
+                        st.session_state.dataframes = final_state["dataframes"]
+                    st.session_state.chat_history.append({
+                        "role":    "assistant",
+                        "content": final_state.get("final_message", "MRI analysis done."),
+                    })
+                    st.rerun()
+
+                # B) Lifting image analysis
+                elif final_state.get("image_analysis_result"):
                     st.session_state.image_analysis_result = final_state["image_analysis_result"]
                     st.session_state.image_analysis_done   = True
                     st.session_state.chat_history.append({
@@ -89,16 +108,9 @@ if not st.session_state.simulation_done and not st.session_state.image_analysis_
                     })
                     st.rerun()
 
-                # B) Medical placeholder
-                elif final_state.get("image_type") == "medical" or (
-                    image_path and not final_state.get("dataframes")
-                    and final_state.get("final_message")
-                ):
-                    st.info(final_state.get("final_message", "Medical image pathway placeholder."))
-
-                # C) OpenSim simulation result
+                # C) Text-only OpenSim simulation
                 elif final_state.get("dataframes"):
-                    st.session_state.dataframes     = final_state["dataframes"]
+                    st.session_state.dataframes      = final_state["dataframes"]
                     st.session_state.simulation_done = True
                     st.session_state.chat_history.append({
                         "role":    "assistant",
@@ -114,7 +126,7 @@ if not st.session_state.simulation_done and not st.session_state.image_analysis_
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2: IMAGE ANALYSIS RESULTS
+# SECTION 2: LIFTING IMAGE ANALYSIS RESULTS
 # ══════════════════════════════════════════════════════════════════════════════
 elif st.session_state.image_analysis_done:
 
@@ -124,7 +136,6 @@ elif st.session_state.image_analysis_done:
     with tab_img:
         st.subheader("Lifting Analysis Results")
 
-        # ── 3-panel static figure (original image + skeleton) ────────────────
         if res and res.get("plot_bytes"):
             _, col_img, _ = st.columns([0.05, 0.9, 0.05])
             with col_img:
@@ -132,14 +143,11 @@ elif st.session_state.image_analysis_done:
                          caption="SAM-3D Analysis — Original Image · 3-D Skeleton",
                          use_container_width=True)
 
-        # ── Interactive PLY mesh (Plotly Mesh3d) ──────────────────────────────
         if res and res.get("ply_fig") is not None:
             st.divider()
             st.subheader("🦴 Interactive 3-D Body Mesh")
             st.plotly_chart(res["ply_fig"], use_container_width=True)
 
-
-        # ── Metrics summary ───────────────────────────────────────────────────
         if res:
             col1, col2 = st.columns(2)
             with col1:
@@ -151,9 +159,9 @@ elif st.session_state.image_analysis_done:
                 })
                 st.markdown("**Pose Metrics**")
                 st.table({
-                    "Flexion F (°)":    [res.get("flexion_deg")],
-                    "Asymmetry A (°)":  [res.get("asymmetry_deg")],
-                    "Reach D (cm)":     [res.get("reach_cm")],
+                    "Flexion F (°)":   [res.get("flexion_deg")],
+                    "Asymmetry A (°)": [res.get("asymmetry_deg")],
+                    "Reach D (cm)":    [res.get("reach_cm")],
                 })
             with col2:
                 loads = res.get("spinal_loads", {})
@@ -165,7 +173,6 @@ elif st.session_state.image_analysis_done:
                     "L5-S1 Shear (N)":       [loads.get("L5S1_shear")],
                 })
 
-        # ── LLM summary text ──────────────────────────────────────────────────
         for msg in st.session_state.chat_history:
             with st.chat_message(msg["role"]):
                 st.markdown(msg.get("content", ""))
@@ -177,10 +184,31 @@ elif st.session_state.image_analysis_done:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3: OPENSIM SIMULATION RESULTS  (unchanged from original)
+# SECTION 3: OPENSIM SIMULATION RESULTS
+# (used by both text-only pathway AND the MRI pathway after model match)
 # ══════════════════════════════════════════════════════════════════════════════
 else:
-    tab1, tab2, tab3 = st.tabs(["💬 Chat Analysis", "📊 Data Explorer", "🔄 New Simulation"])
+    # ── If this came from MRI, show the segmentation plot + selected model ──
+    mri = st.session_state.mri_result
+    if mri:
+        best      = mri.get("best_match", {})
+        plot_path = mri.get("plot_path")
+
+        if plot_path and os.path.exists(plot_path):
+            st.image(plot_path,
+                     caption="MRI Segmentation — Middle Slice (TotalSegmentator)",
+                     use_container_width=True)
+
+        st.success(
+            f"✅ **Selected model:** `{best.get('model_file', 'N/A')}` "
+            f"({best.get('sex', '')} · {best.get('age_group', '')} · "
+            f"distance {best.get('distance_deg', 0):.2f}°)"
+        )
+        st.divider()
+
+    # ── Standard simulation tabs ───────────────────────────────────────────────
+    tab_label = "💬 Chat Analysis" if not mri else "💬 Simulation Chat"
+    tab1, tab2, tab3 = st.tabs([tab_label, "📊 Data Explorer", "🔄 New Simulation"])
 
     # ── TAB 1: CHAT ───────────────────────────────────────────────────────────
     with tab1:
@@ -242,9 +270,9 @@ else:
         st.write("### Simulation Results")
         if st.session_state.dataframes:
             mapping = {
-                "Spinal Loads":        "spinal",
-                "Muscle Forces":       "forces",
-                "Muscle Activations":  "activations",
+                "Spinal Loads":       "spinal",
+                "Muscle Forces":      "forces",
+                "Muscle Activations": "activations",
             }
             df_choice = st.selectbox("Select DataFrame:", list(mapping.keys()))
             key = mapping[df_choice]

@@ -462,7 +462,15 @@ def model_selection_node(state):
     - FALLBACK: Python distance-score if all LLM passes fail.
     """
     print(f"--- Node 2: Selecting Model ({MODEL}) ---")
-    
+
+    # ── MRI fast-path guard ───────────────────────────────────────────────────
+    # If the MRI pipeline already selected a model, skip LLM selection entirely
+    # so we don't overwrite the morphology-matched choice.
+    if state.get("selected_models"):
+        print("   -> Model already selected by MRI pipeline — skipping LLM selection.")
+        return {"current_status": "Model pre-selected by MRI pipeline."}
+    # ─────────────────────────────────────────────────────────────────────────
+
     analysis = state.get('analysis_result')
     if not analysis or 'subject_filter' not in analysis:
         return {"final_message": "Error: Missing subject analysis."}
@@ -1540,17 +1548,160 @@ def image_classifier_node(state):
 
 
 # ── Node C: Medical Placeholder ───────────────────────────────────────────────
-def medical_placeholder_node(state):
-    """Stub for the medical-image pathway (to be implemented later)."""
-    print("--- Medical Placeholder Node ---")
-    return {
-        "final_message": (
-            "🩺 **Medical image detected.**\n\n"
-            "The medical-imaging analysis pathway (CT / MRI / X-ray spine assessment) "
-            "is under development and will be available in a future release."
-        ),
-        "current_status": "Medical image path — placeholder.",
-    }
+# ── Node C: Medical MRI Pipeline ──────────────────────────────────────────────
+def medical_mri_node(state):
+    """
+    Full MRI pipeline node:
+      1. Run TotalSegmentator segmentation on the .mha file
+      2. Extract disc centroids from the segmentation
+      3. Run flip-aware KNN angle matching → pick the single best OpenSim model
+      4. Resolve full .osim path and return it as selected_models (exactly 1 entry)
+         so the graph can continue into activity_router → simulator → ...
+    """
+    print("--- Medical MRI Node: full pipeline ---")
+    mha_path = state.get("uploaded_image_path", "")
+
+    # ── 0. Validate input ─────────────────────────────────────────────────────
+    if not mha_path or not mha_path.lower().endswith(".mha"):
+        return {
+            "final_message": (
+                "⚠️ A `.mha` file is required for MRI analysis. "
+                "Please upload a valid MRI file."
+            ),
+            "current_status": "MRI node: invalid file type.",
+        }
+
+    # ── 1. Run segmentation pipeline ──────────────────────────────────────────
+    try:
+        import sys as _mri_sys
+        import importlib.util as _mri_ilu
+        import pathlib as _mri_pl
+
+        # Dynamically load segment_spine_mri.py (project root)
+        _root = _mri_pl.Path(_os.getcwd())
+        _seg_path = _root / "segment_spine_mri.py"
+        _spec = _mri_ilu.spec_from_file_location("segment_spine_mri", _seg_path)
+        _seg_mod = _mri_ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_seg_mod)
+
+        # run_pipeline performs: mha→nii, segmentation, centroid extraction, plot
+        _seg_mod.run_pipeline(mha_path)
+
+        stem = _os.path.splitext(_os.path.basename(mha_path))[0]
+        results_dir = _os.path.join(_os.getcwd(), "results_medical_image_segmentation")
+
+        # ── 2. Locate the generated plot ──────────────────────────────────────
+        plot_path = _os.path.join(results_dir, stem + "_middle_slice.png")
+        if not _os.path.exists(plot_path):
+            plot_path = None
+
+        # ── 3. Load centroids produced by the pipeline ────────────────────────
+        import glob as _glob
+        import csv as _csv_mod
+
+        centroid_csvs = sorted(
+            _glob.glob(_os.path.join(results_dir, f"{stem}_disc_centroids_*.csv")),
+            key=_os.path.getmtime, reverse=True
+        )
+        if not centroid_csvs:
+            raise RuntimeError("No disc centroid CSV found after segmentation.")
+
+        centroids = []
+        with open(centroid_csvs[0], newline="") as _f:
+            for row in _csv_mod.DictReader(_f):
+                try:
+                    c2_row = float(row["row"]) if row.get("row") not in (None, "N/A", "") else None
+                    c2_col = float(row["col"]) if row.get("col") not in (None, "N/A", "") else None
+                except (ValueError, KeyError):
+                    c2_row = c2_col = None
+                centroids.append({"name": row["disc"], "c2_row": c2_row, "c2_col": c2_col})
+
+        # ── 4. KNN model matching ─────────────────────────────────────────────
+        _match_path = _root / "opensim_files" / "match_mri_to_model.py"
+        _spec2 = _mri_ilu.spec_from_file_location("match_mri_to_model", _match_path)
+        _match_mod = _mri_ilu.module_from_spec(_spec2)
+        _spec2.loader.exec_module(_match_mod)
+
+        metrics_csv = _os.path.join(str(_root), "opensim_files", "spine_curvature_metrics.csv")
+        matches = _match_mod.run_matching(centroids, metrics_csv=metrics_csv, k=5)
+
+        if not matches:
+            raise RuntimeError("Model matching returned no results.")
+
+        best = matches[0]
+
+        # ── 5. Resolve full .osim path via ms_model_details.csv ───────────────
+        import pandas as _pd_mri
+        details_csv = _os.path.join(str(_root), "opensim_files", "ms_model_details.csv")
+        details_df  = _pd_mri.read_csv(details_csv)
+        details_df.columns = details_df.columns.str.strip()
+
+        match_row = details_df[details_df["Filename"] == best["model_file"]]
+        if match_row.empty:
+            raise RuntimeError(
+                f"Model '{best['model_file']}' not found in ms_model_details.csv"
+            )
+        row = match_row.iloc[0]
+
+        # Build absolute path — Directory column uses .\ prefix
+        rel_dir = str(row["Directory"]).replace("\\", "/").lstrip("./")
+        full_path = _os.path.join(str(_root), "opensim_files", rel_dir, row["Filename"])
+        full_path = _os.path.abspath(full_path)
+
+        # ── 6. Build selected_models entry (one model, simulation_node format) ─
+        selected_model = {
+            "Filename":      row["Filename"],
+            "Directory":     rel_dir,
+            "full_path":     full_path,
+            "sex":           str(row.get("sex", "")).capitalize(),
+            "Min Age (year)": float(row.get("Min Age (year)", 0)),
+            "Max Age (year)": float(row.get("Max Age (year)", 0)),
+            "weight (kg)":   float(row.get("weight (kg)", 0)),
+            "height (m)":    float(row.get("height (m)", 0)),
+        }
+
+        # ── 7. Build human-readable summary ───────────────────────────────────
+        ll  = f"{best['lumbar_lordosis_deg']:.1f}°" if best.get("lumbar_lordosis_deg") else "N/A"
+        tk  = f"{best['thoracic_kyphosis_deg']:.1f}°" if best.get("thoracic_kyphosis_deg") else "N/A"
+        orient_tag = best.get("orientation", "")
+        summary = (
+            f"🩺 **MRI Segmentation & Model Matching Complete**\n\n"
+            f"**Best matching OpenSim model:** `{best['model_file']}`\n"
+            f"- **Sex / Age group:** {best['sex']} · {best['age_group']}\n"
+            f"- **Matching distance:** {best['distance_deg']:.2f}° "
+            f"over {best['n_shared_levels']} shared disc levels ({orient_tag})\n"
+            f"- **Lumbar Lordosis:** {ll}  |  **Thoracic Kyphosis:** {tk}\n\n"
+            f"The matched model will now be used for your OpenSim simulation."
+        )
+
+        print(f"   → Best model: {best['model_file']} (distance={best['distance_deg']:.2f}°)")
+
+        return {
+            "selected_models":  [selected_model],
+            "mri_result": {
+                "plot_path":   plot_path,
+                "best_match":  best,
+                "all_matches": matches,
+            },
+            "current_status": (
+                f"MRI analysed. Best model: {best['model_file']} "
+                f"(distance={best['distance_deg']:.2f}°)"
+            ),
+            "final_message": summary,
+        }
+
+    except Exception as _exc:
+        import traceback
+        traceback.print_exc()
+        return {
+            "final_message": (
+                f"🩺 **MRI pipeline error:** {_exc}\n\n"
+                "Please ensure TotalSegmentator is installed in your environment "
+                "and that `spine_curvature_metrics.csv` has been generated."
+            ),
+            "current_status": f"MRI pipeline failed: {_exc}",
+        }
+
 
 
 # ── Node D: SAM-3D Processor ──────────────────────────────────────────────────
