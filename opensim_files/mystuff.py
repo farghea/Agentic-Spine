@@ -59,7 +59,7 @@ try:
         muscle_activations = data.get("muscle_activations")
 
         print("Success!")
-        # print(f"Spinal Loads keys: {list(spinal_loads.keys()) if spinal_loads else 'None'}")
+        print(f"Spinal Loads keys: {list(spinal_loads.keys()) if spinal_loads else 'None'}")
     else:
         print("Error: No JSON data found in output.")
         print("Raw Output:\n", output_str)

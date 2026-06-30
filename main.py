@@ -23,6 +23,14 @@ from utils import (
     lifting_analysis_node,
 )
 
+# --- Sensitivity / FF-Mode pipeline ---
+from utils_sensitivity import (
+    is_sensitivity_prompt,
+    sensitivity_planner_node,
+    sensitivity_executor_node,
+    sensitivity_analyst_node,
+)
+
 # --- 1. Define the Agent State ---
 class AgentState(TypedDict):
     # ── shared ──────────────────────────────────────────────
@@ -43,20 +51,32 @@ class AgentState(TypedDict):
     image_analysis_result: Optional[dict]  # full output from lifting analysis
     mri_result:            Optional[dict]  # plot_path + match info from MRI pipeline
 
+    # ── sensitivity / FF-mode path ───────────────────────────
+    sensitivity_plan:      Optional[dict]  # structured plan from planner
+    sensitivity_cases:     Optional[List[dict]]  # all generated simulation cases
+    sensitivity_results:   Optional[List[dict]]  # per-variant simulation results
+    sensitivity_errors:    Optional[List[dict]]  # reflection / error log
+    sensitivity_iteration: Optional[int]   # number of LLM reflections used
+
 
 # --- 2. Routing Logic ---
 
-def route_input(state: AgentState) -> Literal["medical_mri", "image_classifier", "analyzer"]:
+def route_input(state: AgentState) -> Literal["medical_mri", "image_classifier", "sensitivity_planner", "analyzer"]:
     """Branch at the very entry:
-       .mha file  → medical MRI pipeline (skip classifier — we know it's medical)
-       other image → image classifier → lifting or medical
-       text-only  → OpenSim pipeline
+       .mha file             → medical MRI pipeline
+       other image           → image classifier → lifting or medical
+       text with SA keywords → sensitivity / FF-mode pipeline
+       text-only (normal)    → standard OpenSim pipeline
     """
     path = state.get("uploaded_image_path", "") or ""
     if path.lower().endswith(".mha"):
         return "medical_mri"
     if path:
         return "image_classifier"
+    # Sensitivity / FF-mode check (text-only prompts only)
+    if is_sensitivity_prompt(state.get("user_prompt", "")):
+        print("[Router] Sensitivity/FF-mode keyword detected → sensitivity pipeline")
+        return "sensitivity_planner"
     return "analyzer"
 
 
@@ -98,18 +118,23 @@ def route_model_selection(state: AgentState) -> Literal["simulator", "end"]:
 workflow = StateGraph(AgentState)
 
 # ── Nodes ────────────────────────────────────────────────────────────────────
-workflow.add_node("input_router",     input_router_node)
-workflow.add_node("image_classifier",  image_classifier_node)
-workflow.add_node("medical_mri",       medical_mri_node)
-workflow.add_node("sam3d_processor",   sam3d_node)
-workflow.add_node("lifting_analyzer",  lifting_analysis_node)
+workflow.add_node("input_router",       input_router_node)
+workflow.add_node("image_classifier",   image_classifier_node)
+workflow.add_node("medical_mri",        medical_mri_node)
+workflow.add_node("sam3d_processor",    sam3d_node)
+workflow.add_node("lifting_analyzer",   lifting_analysis_node)
 
-workflow.add_node("analyzer",         analyze_request_node)
-workflow.add_node("activity_router",  activity_router_node)
-workflow.add_node("model_selector",   model_selection_node)
-workflow.add_node("simulator",        simulation_node)
-workflow.add_node("processor",        data_processing_node)
-workflow.add_node("analyst",          analysis_agent_node)
+workflow.add_node("analyzer",          analyze_request_node)
+workflow.add_node("activity_router",   activity_router_node)
+workflow.add_node("model_selector",    model_selection_node)
+workflow.add_node("simulator",         simulation_node)
+workflow.add_node("processor",         data_processing_node)
+workflow.add_node("analyst",           analysis_agent_node)
+
+# ── Sensitivity / FF-mode nodes (additive — existing nodes unchanged) ─────────
+workflow.add_node("sensitivity_planner",  sensitivity_planner_node)
+workflow.add_node("sensitivity_executor", sensitivity_executor_node)
+workflow.add_node("sensitivity_analyst",  sensitivity_analyst_node)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 workflow.set_entry_point("input_router")
@@ -118,8 +143,18 @@ workflow.set_entry_point("input_router")
 workflow.add_conditional_edges(
     "input_router",
     route_input,
-    {"medical_mri": "medical_mri", "image_classifier": "image_classifier", "analyzer": "analyzer"},
+    {
+        "medical_mri":          "medical_mri",
+        "image_classifier":     "image_classifier",
+        "sensitivity_planner": "sensitivity_planner",
+        "analyzer":             "analyzer",
+    },
 )
+
+# ── Sensitivity pipeline edges ────────────────────────────────────────────────
+workflow.add_edge("sensitivity_planner",  "sensitivity_executor")
+workflow.add_edge("sensitivity_executor", "sensitivity_analyst")
+workflow.add_edge("sensitivity_analyst",  END)
 workflow.add_conditional_edges(
     "image_classifier",
     route_image_type,
